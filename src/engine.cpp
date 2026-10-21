@@ -1006,6 +1006,16 @@ struct Job {
             err = L"Couldn't shrink the zip: " + ErrText(GetLastError());
             return false;
         }
+        // Moving the end alone keeps the clusters reserved until the handle closes;
+        // shrinking the allocation too gives them back to the drive right away. Only
+        // ever shrink it: a sparse zip with freed ranges has less allocated than `at`.
+        FILE_STANDARD_INFO info{};
+        if (GetFileInformationByHandleEx(zip, FileStandardInfo, &info, sizeof info) &&
+            uint64_t(info.AllocationSize.QuadPart) > at) {
+            FILE_ALLOCATION_INFO alloc{};
+            alloc.AllocationSize.QuadPart = LONGLONG(at);
+            SetFileInformationByHandle(zip, FileAllocationInfo, &alloc, sizeof alloc);
+        }
         zipSize = at;
         prog.zipBytes = at;
         return true;

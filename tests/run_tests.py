@@ -281,6 +281,30 @@ def main():
     assert code == 1 and "more data than the zip says" in out and os.path.getsize(z) == size0, out
     ok("output is capped at the stored size")
 
+    # space comes back as the zip is cut, so free space never falls below the plan
+    slabs = {"Game/slab-%d.bin" % i: noise(96 << 20, 20 + i) for i in range(8)}
+    z = fresh("space.zip", [(n, v, 0, 0) for n, v in slabs.items()])
+    d = os.path.join(work, "out15")
+    code, out = run("plan", z, d)
+    planned_low = int(out.split("minFree=")[1].split()[0])
+    lowest_free = [shutil.disk_usage(work).free]
+    done = threading.Event()
+
+    def watch_free():
+        while not done.is_set():
+            lowest_free[0] = min(lowest_free[0], shutil.disk_usage(work).free)
+            done.wait(0.01)
+    t = threading.Thread(target=watch_free)
+    t.start()
+    code, out = run("run", z, d)
+    done.set()
+    t.join()
+    assert code == 0, out
+    expect_tree(d, slabs)
+    short = planned_low - lowest_free[0]
+    assert short < 160 << 20, "free space fell %d MB below the plan" % (short >> 20)
+    ok("free space follows the plan as the zip is cut (%+d MB vs plan)" % (-short >> 20))
+
     # hole-punch mode: forced for files over 1 MB, zip space freed mid-file
     huge = noise(640 << 20, 4)
     pents = entries + [("Game/data/huge.bin", huge, 0, 0)]
