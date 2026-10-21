@@ -1,5 +1,6 @@
-"""Draws the ZeroZip icon (a glowing zero on a dark tile) into zerozip.ico.
-Pure Python so it needs nothing installed:  python assets/make_icon.py"""
+"""Draws the ZeroZip icon into zerozip.ico: a blue archive with its zipper
+partly opened, in the Windows 11 icon style. Pure Python, needs nothing installed:
+    python assets/make_icon.py"""
 import math, os, struct, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -12,56 +13,100 @@ def png(w, h, rgba):
             chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
 
 
-def rounded_rect_dist(x, y, s, r):
-    # signed distance to a rounded square of side s centred at s/2
-    qx, qy = abs(x - s / 2) - (s / 2 - r), abs(y - s / 2) - (s / 2 - r)
+def box(x, y, cx, cy, hw, hh, r):
+    """Signed distance to a rounded rectangle centred at (cx, cy)."""
+    qx, qy = abs(x - cx) - (hw - r), abs(y - cy) - (hh - r)
     return math.hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - r
 
 
-def render(size, ss=4):
-    S = size * ss
+def seg(x, y, ax, ay, bx, by):
+    """Distance to the segment a-b."""
+    dx, dy = bx - ax, by - ay
+    t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(x - ax - t * dx, y - ay - t * dy)
+
+
+def mix(a, b, t):
+    return [a[i] + (b[i] - a[i]) * t for i in range(3)]
+
+
+TOP, BOTTOM = (86, 176, 255), (30, 98, 232)
+INSIDE_TOP, INSIDE_BOTTOM = (16, 52, 140), (10, 36, 104)
+LIGHT = (240, 248, 255)
+
+
+def sample(x, y, detail):
+    """Colour and alpha of the icon at (x, y) in 0..1 space."""
+    cx, cy, hw, hh, rad = 0.5, 0.5, 0.36, 0.41, 0.1
+    out, a = [0.0, 0.0, 0.0], 0.0
+    sh = box(x, y, cx, cy + 0.035, hw - 0.01, hh, rad)   # contact shadow under the body
+    if sh < 0.06:
+        out, a = [0, 0, 0], 0.28 * max(0.0, min(1.0, (0.06 - sh) / 0.06)) ** 2
+    d = box(x, y, cx, cy, hw, hh, rad)
+    if d > 0:
+        return out, a
+    t = (y - (cy - hh)) / (2 * hh)
+    col = mix(TOP, BOTTOM, t)
+    # the zipper runs down the middle; below the slider it has come apart
+    slider_y = 0.56
+    if y > slider_y:
+        spread = 0.62
+        if abs(x - cx) < (y - slider_y) * spread:
+            col = mix(INSIDE_TOP, INSIDE_BOTTOM, t)
+        reach = cy + hh - slider_y
+        edge = min(seg(x, y, cx, slider_y, cx - spread * reach, cy + hh),
+                   seg(x, y, cx, slider_y, cx + spread * reach, cy + hh))
+        if edge < 0.022:
+            col = mix(col, LIGHT, 0.92)
+    elif detail:
+        # teeth: small alternating blocks either side of the centre line
+        pitch = 0.055
+        k = math.floor((y - (cy - hh)) / pitch)
+        side = -1 if k % 2 == 0 else 1
+        if box(x, y, cx + side * 0.013, (cy - hh) + (k + 0.5) * pitch, 0.028, 0.024, 0.008) < 0:
+            col = mix(col, LIGHT, 0.95)
+    elif abs(x - cx) < 0.03:
+        col = mix(col, LIGHT, 0.95)
+    # slider and its pull tab
+    sl = box(x, y, cx, slider_y - 0.01, 0.06, 0.05, 0.025)
+    tab = box(x, y, cx, slider_y + 0.075, 0.032, 0.05, 0.03)
+    hole = box(x, y, cx, slider_y + 0.085, 0.012, 0.022, 0.012)
+    if sl < 0 or (tab < 0 and hole > 0):
+        col = [255, 255, 255]
+    elif min(sl, tab) < 0.012:
+        col = mix(col, (8, 40, 110), 0.35)
+    # top highlight and a thin darker rim at the bottom
+    if d > -0.018:
+        col = mix(col, (255, 255, 255) if y < cy else (10, 40, 120), 0.18)
+    edge_a = max(0.0, min(1.0, -d * 220))
+    out = [out[i] * (1 - edge_a) + col[i] * edge_a for i in range(3)]
+    return out, a * (1 - edge_a) + edge_a
+
+
+def render(size, ss):
+    n = size * ss
     acc = [0.0] * (size * size * 4)
-    for py in range(S):
-        for px in range(S):
-            x, y = (px + 0.5) / S, (py + 0.5) / S
-            d = rounded_rect_dist(x, y, 1.0, 0.23)
-            if d > 0:
-                continue
-            # tile: near-black with a faint top highlight
-            col = [10 + 8 * (1 - y), 12 + 8 * (1 - y), 15 + 9 * (1 - y)]
-            # zero: an ellipse ring
-            ex, ey = (x - 0.5) / 0.205, (y - 0.5) / 0.285
-            rr = math.hypot(ex, ey)
-            ring = abs(rr - 1.0) * 0.24
-            width = 0.052
-            glow = max(0.0, 1 - ring / 0.16) ** 3 * 0.55
-            g = (0.16 + 0.84 * (1 - y))           # gradient top -> bottom
-            mint = (52 + 60 * g, 211 + 30 * g, 153 + 60 * g)
-            if ring < width:
-                a = min(1.0, (width - ring) / 0.012)
-                col = [c * (1 - a) + m * a for c, m in zip(col, mint)]
-            else:
-                col = [min(255, c + m * glow * 0.35) for c, m in zip(col, mint)]
-            # hairline edge on the tile
-            if d > -0.012:
-                col = [c + 18 for c in col]
-            i = ((py // ss) * size + (px // ss)) * 4
+    detail = size >= 32
+    for py in range(n):
+        for px in range(n):
+            col, a = sample((px + 0.5) / n, (py + 0.5) / n, detail)
+            i = ((py // ss) * size + px // ss) * 4
             for k in range(3):
-                acc[i + k] += col[k]
-            acc[i + 3] += 255
-    n = ss * ss
+                acc[i + k] += col[k] * a
+            acc[i + 3] += a
     out = bytearray(size * size * 4)
+    m = ss * ss
     for i in range(size * size):
-        a = acc[i * 4 + 3] / n
-        out[i * 4 + 3] = int(round(a))
+        a = acc[i * 4 + 3]
+        out[i * 4 + 3] = int(round(a / m * 255))
         for k in range(3):
-            out[i * 4 + k] = int(round(acc[i * 4 + k] / n / (a / 255))) if a else 0
+            out[i * 4 + k] = int(round(min(255.0, acc[i * 4 + k] / a))) if a else 0
     return bytes(out)
 
 
 def main():
-    sizes = [16, 24, 32, 48, 64, 128, 256]
-    images = [png(s, s, render(s, 4 if s <= 64 else 2)) for s in sizes]
+    sizes = [16, 20, 24, 32, 40, 48, 64, 256]
+    images = [png(s, s, render(s, 6 if s <= 48 else 3 if s <= 64 else 2)) for s in sizes]
     head = struct.pack("<HHH", 0, 1, len(sizes))
     off = 6 + 16 * len(sizes)
     dirs = b""
