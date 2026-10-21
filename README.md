@@ -4,6 +4,27 @@ Extract huge zip files on a nearly full drive.
 
 A normal unzip needs free space for everything inside the zip, while the zip itself still sits on the drive. A 100 GB game zip needs roughly another 115 GB free. ZeroZip gives the zip's space back while it extracts, so it needs only about the difference between the unpacked size and the zip, plus room for one file.
 
+## Download
+
+[ZeroZip.exe](https://github.com/shanuflash/zerozip/releases/latest/download/ZeroZip.exe), the latest release. There's nothing to install: run it, then drop a zip on the window or on the exe.
+
+Or with winget:
+
+```
+winget install shanuflash.ZeroZip
+```
+
+The exe isn't code-signed yet, so Windows SmartScreen may warn the first time: choose "More info", then "Run anyway".
+
+## Right-click menu
+
+The switch on the first screen adds **Extract with ZeroZip** to the right-click menu of zip files, for your Windows account only. It sits next to WinRAR or 7-Zip without changing which app opens zips.
+
+- **Windows 11:** the entry is at the top of the menu. Windows only allows that for an app package, so ZeroZip installs a small one (`assets/package`) that points Explorer at `ZeroZipShell.dll` in `%LOCALAPPDATA%\Programs\ZeroZip`. The package isn't signed, so turning the switch on asks for admin once. Turning it off doesn't.
+- **Windows 10:** the entry is a plain registry entry, with no admin needed.
+
+Moving or updating ZeroZip.exe doesn't break the entry. Turn the switch off before deleting ZeroZip for good.
+
 ## How it works
 
 A zip stores its files one after another, with an index at the end. ZeroZip:
@@ -67,13 +88,13 @@ Windows 10 or 11 (x64). Nothing to install: ZeroZip is one small exe.
 
 The window is drawn natively with Direct2D and DirectWrite, in ZeroZip's own dark look with the Geist fonts built in. It looks the same on Windows 10 and 11.
 
-Measured on Windows 11, it uses about 16–20 MB of private memory while idle and about 32 MB while extracting.
+Measured on Windows 11, it uses about 10–14 MB of private memory and no CPU while idle, and about 23 MB while extracting.
 
 Not done yet: screen readers can't read the window, and High Contrast themes aren't followed.
 
 ## Building
 
-Needs Visual Studio 2022 or newer with the C++ desktop workload.
+Needs Visual Studio 2022 or newer with the C++ desktop workload, which includes the Windows SDK (for `makeappx`, which packs the right-click menu package).
 
 ```bat
 build.bat          :: builds ZeroZip.exe
@@ -101,9 +122,10 @@ Test switches, read from the environment:
 src/engine.*      zip index, space planning, extract + truncate / hole punching
 src/gfx.*         Direct2D / DirectWrite drawing in the ZeroZip style, with the embedded fonts
 src/main.cpp      the window, its screens and input, and the engine on a worker thread
+src/shell.cpp     ZeroZipShell.dll, the Windows 11 right-click entry
 third_party/      zstd (decoder) and miniz (inflate)
 tests/            engine tests
-assets/           the icon, the script that draws it, and the fonts
+assets/           the icon, the script that draws it, the fonts, and the menu package
 ```
 
 ## Credits
