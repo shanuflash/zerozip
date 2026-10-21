@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Registers ZeroZipShell.dll with Explorer for the Windows 11 right-click menu. The package
+     only holds this file and its logos; the DLL lives in the folder ZeroZip installs it from.
+     It's unsigned, so the publisher carries the OID Windows requires for that, and ZeroZip's
+     code looks it up by this name and publisher. Raise the version along with ZeroZip's. -->
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+  xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  IgnorableNamespaces="uap uap10 rescap desktop4 desktop5 desktop6 com">
+  <Identity Name="ZeroZip" Publisher="CN=ZeroZip, OID.2.25.311729368913984317654407730594956997722=1" Version="1.2.0.0" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>ZeroZip</DisplayName>
+    <PublisherDisplayName>ZeroZip</PublisherDisplayName>
+    <Logo>StoreLogo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+    <!-- the DLL sees the real file system and registry, as ZeroZip does -->
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
+    <desktop6:RegistryWriteVirtualization>disabled</desktop6:RegistryWriteVirtualization>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+  <Applications>
+    <Application Id="ZeroZip" Executable="ZeroZip.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements AppListEntry="none" DisplayName="ZeroZip" Description="Extract with ZeroZip" BackgroundColor="transparent"
+        Square150x150Logo="Square150x150Logo.png" Square44x44Logo="Square44x44Logo.png" />
+      <Extensions>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="ZeroZip">
+              <com:Class Id="5d1f1c3e-6a51-4f6e-9c1b-2f7a8a0e1d42" Path="ZeroZipShell.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type=".zip">
+              <desktop5:Verb Id="ZeroZipExtract" Clsid="5d1f1c3e-6a51-4f6e-9c1b-2f7a8a0e1d42" />
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

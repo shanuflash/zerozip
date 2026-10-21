@@ -31,8 +31,17 @@ if "%1"=="test" (
     exit /b 0
 )
 
+rem The Windows 11 right-click entry: a small DLL Explorer loads, and the package that registers
+rem it. Both are built into ZeroZip.exe, which installs them when the menu is turned on.
+cl %CFLAGS% /LD /Fobuild\ src\shell.cpp /Fe:build\ZeroZipShell.dll ^
+   /link /DEF:src\shell.def /OPT:REF shell32.lib shlwapi.lib ole32.lib advapi32.lib || exit /b 1
+if exist build\package rmdir /s /q build\package
+mkdir build\package
+copy /y assets\package\* build\package >nul || exit /b 1
+"%WindowsSdkVerBinPath%x64\makeappx.exe" pack /d build\package /p build\ZeroZip.msix /nv /o >nul || exit /b 1
+
 rc /nologo /fo build\zerozip.res src\zerozip.rc || exit /b 1
 cl %CFLAGS% /Fobuild\ src\main.cpp src\gfx.cpp src\engine.cpp build\zerozip.res build\deps.lib /Fe:ZeroZip.exe ^
    /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF user32.lib ole32.lib shell32.lib shlwapi.lib dwmapi.lib advapi32.lib ^
-   d2d1.lib dwrite.lib || exit /b 1
+   d2d1.lib dwrite.lib kernel32.lib || exit /b 1
 echo Built ZeroZip.exe

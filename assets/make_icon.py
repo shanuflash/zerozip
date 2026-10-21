@@ -1,5 +1,5 @@
-"""Draws the ZeroZip icon into zerozip.ico: a mint archive with its zipper
-partly opened. Pure Python, needs nothing installed:
+"""Draws the ZeroZip icon into zerozip.ico and the package logos: a mint archive with
+its zipper partly opened. Pure Python, needs nothing installed:
     python assets/make_icon.py"""
 import math, os, struct, zlib
 
@@ -117,6 +117,10 @@ def main():
         f.write(head + dirs + b"".join(images))
     with open(os.path.join(HERE, "zerozip-256.png"), "wb") as f:
         f.write(images[-1])
+    # logos the right-click menu package needs
+    for name, s in (("StoreLogo.png", 50), ("Square44x44Logo.png", 44), ("Square150x150Logo.png", 150)):
+        with open(os.path.join(HERE, "package", name), "wb") as f:
+            f.write(png(s, s, render(s, 4)))
 
 
 if __name__ == "__main__":

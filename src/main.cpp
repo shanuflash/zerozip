@@ -2,8 +2,10 @@
 // driving the engine on a worker thread.
 #define NOMINMAX
 #include <windows.h>
+#include <appmodel.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <windowsx.h>
@@ -28,6 +30,7 @@ namespace {
 constexpr UINT WM_APP_ANALYSIS = WM_APP + 1;   // lParam: AnalysisResult*
 constexpr UINT WM_APP_DONE = WM_APP + 2;       // lParam: RunResult*
 constexpr UINT WM_APP_FIT = WM_APP + 3;        // wParam: client height wanted, in pixels
+constexpr UINT WM_APP_MENU = WM_APP + 4;       // wParam: how switching the right-click menu went
 constexpr UINT_PTR kTick = 1;                  // frames while extracting
 constexpr UINT_PTR kAnim = 2;                  // busy bar while a zip is read
 constexpr double GiB = 1024.0 * 1024 * 1024;
@@ -40,7 +43,7 @@ constexpr wchar_t kGlyphDownload[] = L"\xE896", kGlyphFolder[] = L"\xE8B7", kGly
 
 enum class Screen { Home, Reading, Ready, Running, End };
 enum class EndKind { Done, Stopped, Problem, CantOpen };
-enum Id { kNone, kBrowse, kChange, kCancel, kExtract, kPause, kStop, kOpen, kAnother, kResume, kRetry };
+enum Id { kNone, kBrowse, kChange, kCancel, kExtract, kPause, kStop, kOpen, kAnother, kResume, kRetry, kMenu };
 enum class Kind { Primary, Ghost, Icon };
 enum class Tone { Good, Warn, Bad };
 
@@ -84,6 +87,9 @@ int g_hover = kNone, g_press = kNone, g_focus = kNone;
 bool g_keyboard = false;           // show the focus ring only after Tab
 int g_fitAsked = 0;
 struct Drive { std::wstring name; uint64_t free, total; };
+bool g_menu = false;               // "Extract with ZeroZip" is on the right-click menu
+bool g_menuBusy = false;           // waiting on Windows to add or remove it
+std::wstring g_menuNote;           // why it couldn't be turned on
 std::vector<Drive> g_drives;       // fixed drives, shown on the home screen                // last height asked for, so a clamped window isn't asked again
 
 // ---- text ------------------------------------------------------------------------
@@ -212,6 +218,18 @@ void Buttons(float right, float y, const std::vector<std::pair<int, std::wstring
     }
 }
 
+void Switch(int id, float x, float y, bool on) {
+    const Theme& t = g_gfx.theme;
+    D2D1_RECT_F r = R(x, y, 40, 22);
+    if (on) g_gfx.Fill(r, g_hover == id ? t.accentHover : t.accent, 11);
+    else {
+        g_gfx.Fill(r, g_hover == id ? t.ghostHover : t.ghost, 11);
+        g_gfx.Stroke(r, t.ghostLine, 11);
+    }
+    g_gfx.Circle({on ? r.right - 11 : r.left + 11, y + 11}, 7, on ? t.accentInk : t.text2);
+    if (g_keyboard && g_focus == id) g_gfx.Stroke(D2D1::RectF(r.left - 3, r.top - 3, r.right + 3, r.bottom + 3), t.accentLine, 14, 2);
+}
+
 // A coloured pill with a glyph, for the verdict and notices. Returns its height.
 float Badge(float x, float y, Tone tone, const std::wstring& text) {
     const Theme& t = g_gfx.theme;
@@ -267,7 +285,16 @@ float DrawHome(float W) {
     g_gfx.Text(L"Drop a zip here", Font::Subtitle, R(kPad, y + 64, w, 28), t.text1, Align::Center);
     std::wstring choose = L"Choose zip";
     Button(kBrowse, cx - ButtonWidth(choose, Kind::Primary) / 2, y + 104, choose, Kind::Primary);
-    y = kPad + 196;
+    y = kPad + 196 + 12;
+    D2D1_RECT_F menu = R(kPad, y, w, 60);   // the whole row toggles it
+    Card(menu);
+    g_hits.push_back({kMenu, menu, !g_menuBusy});
+    g_gfx.Text(L"Right-click menu", Font::BodyStrong, R(kPad + 18, y + 10, w - 100, 20), t.text1);
+    if (g_menuBusy) g_gfx.Text(L"Waiting for Windows\u2026", Font::Caption, R(kPad + 18, y + 32, w - 100, 16), t.text2);
+    else if (!g_menuNote.empty()) g_gfx.Text(g_menuNote, Font::Caption, R(kPad + 18, y + 32, w - 100, 16), t.warn);
+    else g_gfx.Text(L"Extract with ZeroZip, on any zip", Font::Caption, R(kPad + 18, y + 32, w - 100, 16), t.text2);
+    Switch(kMenu, kPad + w - 18 - 40, y + 19, g_menu);
+    y += 60;
     if (g_drives.empty()) return y;
     y += 12;
     float h = 12 + float(g_drives.size()) * 46 + 2;
@@ -540,6 +567,195 @@ void LoadDrives() {
     }
 }
 
+// Windows 11 only puts an app's entry at the top of the right-click menu if it comes from
+// an app package. ZeroZip installs a small unsigned one that points Explorer at
+// ZeroZipShell.dll; an unsigned package takes admin to install, so turning the menu on asks
+// once, and turning it off doesn't. Windows 10 gets a plain registry entry.
+// Both are for this user only, and go on zips whichever app owns them.
+constexpr wchar_t kMenuKey[] = L"Software\\Classes\\SystemFileAssociations\\.zip\\shell\\ZeroZip";
+constexpr wchar_t kPublisher[] = L"CN=ZeroZip, OID.2.25.311729368913984317654407730594956997722=1";   // as in the package manifest
+bool g_modernMenu = false;         // Windows 11's menu
+
+bool Windows11() {
+    auto get = reinterpret_cast<LONG(WINAPI*)(OSVERSIONINFOW*)>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+    OSVERSIONINFOW v{sizeof v};
+    return get && get(&v) == 0 && v.dwBuildNumber >= 22000;
+}
+
+std::wstring ExePath() {
+    std::wstring s(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD n = GetModuleFileNameW(nullptr, s.data(), DWORD(s.size()));
+        if (n < s.size()) return s.substr(0, n);
+        s.resize(s.size() * 2);
+    }
+}
+
+std::wstring MenuCommand() { return L"\"" + ExePath() + L"\" \"%1\""; }
+
+bool SetMenu(bool on) {
+    bool ok;
+    if (on) {
+        auto set = [](const std::wstring& key, const wchar_t* name, const std::wstring& v) {
+            return RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), name, REG_SZ, v.c_str(), DWORD((v.size() + 1) * sizeof(wchar_t))) ==
+                   ERROR_SUCCESS;
+        };
+        ok = set(kMenuKey, nullptr, L"Extract with ZeroZip") && set(kMenuKey, L"Icon", ExePath() + L",0") &&
+             set(kMenuKey, L"MultiSelectModel", L"Single") && set(std::wstring(kMenuKey) + L"\\command", nullptr, MenuCommand());
+    } else {
+        LSTATUS r = RegDeleteTreeW(HKEY_CURRENT_USER, kMenuKey);
+        ok = r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND;
+    }
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    return ok;
+}
+
+// The full name of ZeroZip's package, if it's installed.
+std::wstring MenuPackage() {
+    PACKAGE_ID id{};
+    id.name = const_cast<PWSTR>(L"ZeroZip");
+    id.publisher = const_cast<PWSTR>(kPublisher);
+    wchar_t family[PACKAGE_FAMILY_NAME_MAX_LENGTH + 1];
+    UINT32 n = ARRAYSIZE(family), count = 0, length = 0;
+    if (PackageFamilyNameFromId(&id, &n, family) != ERROR_SUCCESS ||
+        GetPackagesByPackageFamily(family, &count, nullptr, &length, nullptr) != ERROR_INSUFFICIENT_BUFFER || !count)
+        return {};
+    std::vector<PWSTR> names(count);
+    std::vector<wchar_t> buffer(length);
+    if (GetPackagesByPackageFamily(family, &count, names.data(), &length, buffer.data()) != ERROR_SUCCESS || !count) return {};
+    return names[0];
+}
+
+// The package points Explorer at this folder: the DLL, and a copy of ZeroZip.exe for it to
+// fall back on. It's where per-user apps install; Windows won't use a folder straight
+// under AppData\Local for this.
+std::wstring MenuFolder() {
+    PWSTR programs = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_UserProgramFiles, KF_FLAG_CREATE, nullptr, &programs))) return {};
+    std::wstring dir = std::wstring(programs) + L"\\ZeroZip";
+    CoTaskMemFree(programs);
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+// The package file is only needed while it installs.
+std::wstring PackageFile() {
+    wchar_t temp[MAX_PATH + 1];
+    return GetTempPathW(MAX_PATH + 1, temp) ? std::wstring(temp) + L"ZeroZip-menu.msix" : std::wstring();
+}
+
+// The DLL reads this to find ZeroZip wherever it is now.
+void SavePath() {
+    std::wstring exe = ExePath();
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\ZeroZip", L"Path", REG_SZ, exe.c_str(), DWORD((exe.size() + 1) * sizeof(wchar_t)));
+}
+
+bool WriteResource(int id, const std::wstring& path) {
+    HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(id), RT_RCDATA);
+    HGLOBAL mem = res ? LoadResource(nullptr, res) : nullptr;
+    const void* data = mem ? LockResource(mem) : nullptr;
+    DWORD size = res ? SizeofResource(nullptr, res) : 0;
+    if (!data) return false;
+    auto write = [&] {
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return false;
+        DWORD wrote = 0;
+        bool ok = WriteFile(f, data, size, &wrote, nullptr) && wrote == size;
+        CloseHandle(f);
+        return ok;
+    };
+    if (write()) return true;
+    // Explorer may have the old DLL loaded. A loaded file can still be renamed out of the way.
+    std::wstring old = path + L".old";
+    DeleteFileW(old.c_str());
+    return MoveFileExW(path.c_str(), old.c_str(), 0) && write();
+}
+
+std::wstring Quoted(const std::wstring& s) {   // for PowerShell
+    std::wstring out = L"'";
+    for (wchar_t c : s) out += c == L'\'' ? L"''" : std::wstring(1, c);
+    return out + L"'";
+}
+
+DWORD PowerShell(const std::wstring& script) {
+    wchar_t sys[MAX_PATH];
+    GetSystemDirectoryW(sys, MAX_PATH);
+    std::wstring cmd = L"\"" + std::wstring(sys) + L"\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -Command \"try { " +
+                       script + L" -ErrorAction Stop } catch { exit 1 }\"";
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return 1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return code;
+}
+
+// The admin half of turning it on, run as `ZeroZip.exe --add-menu <folder> <package>`.
+int AddMenuPackage(const std::wstring& dir, const std::wstring& package) {
+    return int(PowerShell(L"Add-AppxPackage -Path " + Quoted(package) + L" -ExternalLocation " + Quoted(dir) + L" -AllowUnsigned"));
+}
+
+enum MenuResult { kMenuFailed, kMenuDone, kMenuCancelled };
+
+// Runs on a worker thread, since it waits on the admin prompt and the install.
+MenuResult SwitchModernMenu(bool on) {
+    if (!on) {
+        std::wstring name = MenuPackage();
+        return name.empty() || PowerShell(L"Remove-AppxPackage -Package " + Quoted(name)) == 0 ? kMenuDone : kMenuFailed;
+    }
+    std::wstring dir = MenuFolder(), package = PackageFile(), exe = ExePath(), copy = dir + L"\\ZeroZip.exe";
+    if (dir.empty() || package.empty() || !WriteResource(IDR_SHELL_DLL, dir + L"\\ZeroZipShell.dll") ||
+        !WriteResource(IDR_SHELL_PACKAGE, package))
+        return kMenuFailed;
+    if (lstrcmpiW(exe.c_str(), copy.c_str()) != 0) CopyFileW(exe.c_str(), copy.c_str(), FALSE);
+    SavePath();
+    std::wstring args = L"--add-menu \"" + dir + L"\" \"" + package + L"\"";
+    SHELLEXECUTEINFOW run{sizeof run};
+    run.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    run.hwnd = g_hwnd;
+    run.lpVerb = L"runas";
+    run.lpFile = exe.c_str();
+    run.lpParameters = args.c_str();
+    run.nShow = SW_HIDE;
+    BOOL started = ShellExecuteExW(&run);
+    DWORD error = GetLastError(), code = 1;
+    if (started && run.hProcess) {
+        WaitForSingleObject(run.hProcess, INFINITE);
+        GetExitCodeProcess(run.hProcess, &code);
+        CloseHandle(run.hProcess);
+    }
+    DeleteFileW(package.c_str());
+    if (!started) return error == ERROR_CANCELLED ? kMenuCancelled : kMenuFailed;
+    return code == 0 ? kMenuDone : kMenuFailed;
+}
+
+void OnMenuSwitched(MenuResult r) {
+    g_menuBusy = false;
+    g_menu = !MenuPackage().empty();
+    g_menuNote = r == kMenuFailed ? (g_menu ? L"Windows couldn't remove it" : L"Windows couldn't add it") : L"";
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// If the menu is on, it's pointed at this exe, so moving or updating ZeroZip doesn't break it.
+void LoadMenu() {
+    g_modernMenu = Windows11();
+    if (g_modernMenu) {
+        g_menu = !MenuPackage().empty();
+        if (g_menu) SavePath();
+        RegDeleteTreeW(HKEY_CURRENT_USER, kMenuKey);   // a Windows 10 style entry would show up twice
+        return;
+    }
+    wchar_t v[2048];
+    DWORD size = sizeof v;
+    g_menu = RegGetValueW(HKEY_CURRENT_USER, (std::wstring(kMenuKey) + L"\\command").c_str(), nullptr, RRF_RT_REG_SZ, nullptr, v,
+                          &size) == ERROR_SUCCESS;
+    if (g_menu && MenuCommand() != v) SetMenu(true);
+}
+
 void Go(Screen s) {
     if (s == Screen::Home) {
         LoadDrives();
@@ -776,6 +992,15 @@ void Click(int id) {
         case kOpen: ShellExecuteW(g_hwnd, L"open", g_a.dest.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
         case kResume: Read(g_a.zip, g_a.dest); break;
         case kRetry: Read(g_zip, g_zipDest); break;
+        case kMenu:
+            g_menuNote.clear();
+            if (!g_modernMenu) {
+                if (SetMenu(!g_menu)) g_menu = !g_menu;
+            } else if (!g_menuBusy) {
+                g_menuBusy = true;
+                std::thread([on = !g_menu] { PostMessageW(g_hwnd, WM_APP_MENU, WPARAM(SwitchModernMenu(on)), 0); }).detach();
+            }
+            break;
     }
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
@@ -912,6 +1137,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_DONE:
             OnDone(reinterpret_cast<RunResult*>(lp));
             return 0;
+        case WM_APP_MENU:
+            OnMenuSwitched(MenuResult(wp));
+            return 0;
         case WM_CLOSE:
             if (g_running) {
                 if (g_closing) return 0;
@@ -949,6 +1177,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv && argc == 4 && lstrcmpW(argv[1], L"--add-menu") == 0) return AddMenuPackage(argv[2], argv[3]);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     WNDCLASSEXW wc{sizeof wc};
@@ -978,12 +1209,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_taskbar));
     if (g_taskbar && FAILED(g_taskbar->HrInit())) g_taskbar.Reset();
 
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc > 1) Read(argv[1], L"");
     LocalFree(argv);
 
     LoadDrives();
+    LoadMenu();
     ShowWindow(g_hwnd, show);
     UpdateWindow(g_hwnd);
     MSG m;
