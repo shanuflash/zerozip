@@ -30,6 +30,9 @@ bool Gfx::Init(HWND hwnd, HINSTANCE inst, int sansFont, int monoFont) {
     dash.dashStyle = D2D1_DASH_STYLE_CUSTOM;
     float pattern[] = {6, 6};
     d2d_->CreateStrokeStyle(dash, pattern, 2, &dash_);
+    D2D1_STROKE_STYLE_PROPERTIES round = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                                                                     D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND);
+    d2d_->CreateStrokeStyle(round, nullptr, 0, &round_);
     if (LoadFonts(inst, sansFont, monoFont)) {
         sans_ = L"Geist";
         mono_ = L"Geist Mono";
@@ -42,14 +45,13 @@ bool Gfx::Init(HWND hwnd, HINSTANCE inst, int sansFont, int monoFont) {
     Theme& c = theme;
     c.bg = Rgb(7, 8, 10);
     c.text1 = Rgb(243, 244, 246); c.text2 = Rgb(141, 145, 155); c.text3 = Rgb(88, 92, 102); c.textDisabled = Rgb(243, 244, 246, .35f);
-    c.shell = White(.028f); c.shellLine = White(.07f); c.coreTop = Rgb(17, 19, 24); c.coreBottom = Rgb(13, 14, 18);
-    c.coreHighlight = White(.055f); c.hair = White(.06f); c.dashed = White(.1f);
+    c.card = Rgb(16, 17, 21); c.cardLine = White(.07f); c.dashed = White(.1f);
     c.ghost = White(.04f); c.ghostHover = White(.07f); c.ghostLine = White(.08f);
-    c.accent = Rgb(62, 224, 161); c.accent2 = Rgb(94, 234, 212); c.accentHover = Rgb(85, 232, 176); c.accentInk = Rgb(4, 20, 13);
+    c.accent = Rgb(62, 224, 161); c.accentHover = Rgb(85, 232, 176); c.accentInk = Rgb(4, 20, 13);
     c.accentTint = Rgb(62, 224, 161, .08f); c.accentLine = Rgb(62, 224, 161, .22f);
     c.warn = Rgb(245, 196, 81); c.warnTint = Rgb(245, 196, 81, .08f); c.warnLine = Rgb(245, 196, 81, .22f);
     c.danger = Rgb(255, 122, 122); c.dangerTint = Rgb(255, 122, 122, .08f); c.dangerLine = Rgb(255, 122, 122, .22f);
-    c.track = White(.05f); c.smoke = Rgb(4, 5, 6, .66f);
+    c.track = White(.05f);
     return true;
 }
 
@@ -109,6 +111,7 @@ bool Gfx::Begin() {
         auto hprops = D2D1::HwndRenderTargetProperties(hwnd_, D2D1::SizeU(UINT(rc.right - rc.left), UINT(rc.bottom - rc.top)));
         if (FAILED(d2d_->CreateHwndRenderTarget(props, hprops, &rt_))) return false;
         rt_->CreateSolidColorBrush(theme.text1, &brush_);
+        rt_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);   // no colour fringes on thin icons
     }
     rt_->BeginDraw();
     offsetY_ = 0;
@@ -141,12 +144,9 @@ IDWriteTextFormat* Gfx::Format(Font f) {
         case Font::Caption: s = {&sans_, 12, 400}; break;
         case Font::Body: s = {&sans_, 14, 400}; break;
         case Font::BodyStrong: s = {&sans_, 14, 500}; break;
-        case Font::Brand: s = {&sans_, 15, 600}; break;
         case Font::Subtitle: s = {&sans_, 20, 500}; break;
         case Font::Title: s = {&sans_, 30, 500}; break;
         case Font::Mono: s = {&mono_, 12.5f, 400}; break;
-        case Font::MonoStrong: s = {&mono_, 18, 500}; break;
-        case Font::MonoLarge: s = {&mono_, 72, 400}; break;
         case Font::Icon16: s = {&icons_, 16, 400}; break;
         case Font::Icon20: s = {&icons_, 20, 400}; break;
         case Font::Icon28: s = {&icons_, 28, 400}; break;
@@ -173,7 +173,7 @@ ComPtr<IDWriteTextLayout> Gfx::Layout(const std::wstring& s, Font f, float w, fl
         layout->SetTrimming(&trim, ellipsis.Get());
     }
     // big type is set tight
-    float track = f == Font::Title ? -.035f : f == Font::MonoLarge ? -.06f : f == Font::Brand || f == Font::Subtitle ? -.02f : 0;
+    float track = f == Font::Title ? -.035f : f == Font::Subtitle ? -.02f : 0;
     ComPtr<IDWriteTextLayout1> l1;
     if (track != 0 && SUCCEEDED(layout.As(&l1)))
         l1->SetCharacterSpacing(0, track * fmt->GetFontSize(), 0, DWRITE_TEXT_RANGE{0, UINT32(s.size())});
@@ -183,29 +183,6 @@ ComPtr<IDWriteTextLayout> Gfx::Layout(const std::wstring& s, Font f, float w, fl
 void Gfx::Fill(const D2D1_RECT_F& r, D2D1_COLOR_F c, float radius) {
     if (radius > 0) rt_->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), Brush(c));
     else rt_->FillRectangle(r, Brush(c));
-}
-
-void Gfx::Gradient(const D2D1_RECT_F& r, D2D1_COLOR_F from, D2D1_COLOR_F to, float radius, bool vertical) {
-    D2D1_GRADIENT_STOP stops[] = {{0, from}, {1, to}};
-    ComPtr<ID2D1GradientStopCollection> coll;
-    ComPtr<ID2D1LinearGradientBrush> brush;
-    rt_->CreateGradientStopCollection(stops, 2, &coll);
-    D2D1_POINT_2F end = vertical ? D2D1::Point2F(r.left, r.bottom) : D2D1::Point2F(r.right, r.top);
-    rt_->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(r.left, r.top), end), coll.Get(), &brush);
-    if (radius > 0) rt_->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), brush.Get());
-    else rt_->FillRectangle(r, brush.Get());
-}
-
-void Gfx::Glow(D2D1_POINT_2F center, float radius, D2D1_COLOR_F c) {
-    D2D1_COLOR_F clear = c;
-    clear.a = 0;
-    D2D1_GRADIENT_STOP stops[] = {{0, c}, {1, clear}};
-    ComPtr<ID2D1GradientStopCollection> coll;
-    ComPtr<ID2D1RadialGradientBrush> brush;
-    rt_->CreateGradientStopCollection(stops, 2, &coll);
-    rt_->CreateRadialGradientBrush(D2D1::RadialGradientBrushProperties(center, D2D1::Point2F(), radius, radius), coll.Get(),
-                                   &brush);
-    rt_->FillEllipse(D2D1::Ellipse(center, radius, radius), brush.Get());
 }
 
 void Gfx::Stroke(const D2D1_RECT_F& r, D2D1_COLOR_F c, float radius, float width, bool dashed) {
@@ -227,6 +204,48 @@ void Gfx::Line(D2D1_POINT_2F a, D2D1_POINT_2F b, D2D1_COLOR_F c, float width) {
 
 void Gfx::Circle(D2D1_POINT_2F c, float r, D2D1_COLOR_F fill) {
     rt_->FillEllipse(D2D1::Ellipse(c, r, r), Brush(fill));
+}
+
+void Gfx::Area(const D2D1_RECT_F& r, const std::vector<D2D1_POINT_2F>& pts, D2D1_COLOR_F line, D2D1_COLOR_F fill) {
+    if (pts.size() < 2) return;
+    ComPtr<ID2D1PathGeometry> area, edge;
+    ComPtr<ID2D1GeometrySink> sink;
+    d2d_->CreatePathGeometry(&area);
+    area->Open(&sink);
+    // Catmull-Rom through the points, as cubic Beziers. Each segment depends only on its
+    // neighbours, so adding a point can only nudge the end of the curve.
+    auto curve = [&](ID2D1GeometrySink* sk) {
+        for (size_t i = 0; i + 1 < pts.size(); i++) {
+            D2D1_POINT_2F p0 = pts[i ? i - 1 : 0], p1 = pts[i], p2 = pts[i + 1], p3 = pts[std::min(i + 2, pts.size() - 1)];
+            D2D1_POINT_2F c1 = {p1.x + (p2.x - p0.x) / 6, std::clamp(p1.y + (p2.y - p0.y) / 6, r.top, r.bottom)};
+            D2D1_POINT_2F c2 = {p2.x - (p3.x - p1.x) / 6, std::clamp(p2.y - (p3.y - p1.y) / 6, r.top, r.bottom)};
+            sk->AddBezier(D2D1::BezierSegment(c1, c2, p2));
+        }
+    };
+    sink->BeginFigure(D2D1::Point2F(pts.front().x, r.bottom), D2D1_FIGURE_BEGIN_FILLED);
+    sink->AddLine(pts.front());
+    curve(sink.Get());
+    sink->AddLine(D2D1::Point2F(pts.back().x, r.bottom));
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    sink->Close();
+    sink.Reset();
+    d2d_->CreatePathGeometry(&edge);
+    edge->Open(&sink);
+    sink->BeginFigure(pts.front(), D2D1_FIGURE_BEGIN_HOLLOW);
+    curve(sink.Get());
+    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+    sink->Close();
+
+    D2D1_COLOR_F clear = fill;
+    clear.a = 0;
+    D2D1_GRADIENT_STOP stops[] = {{0, fill}, {1, clear}};
+    ComPtr<ID2D1GradientStopCollection> coll;
+    ComPtr<ID2D1LinearGradientBrush> brush;
+    rt_->CreateGradientStopCollection(stops, 2, &coll);
+    rt_->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, r.top), D2D1::Point2F(0, r.bottom)),
+                                   coll.Get(), &brush);
+    rt_->FillGeometry(area.Get(), brush.Get());
+    rt_->DrawGeometry(edge.Get(), Brush(line), 1.6f, round_.Get());
 }
 
 float Gfx::Text(const std::wstring& s, Font f, const D2D1_RECT_F& r, D2D1_COLOR_F c, Align a, bool wrap) {

@@ -9,19 +9,20 @@
 #include <wrl/client.h>
 
 #include <string>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
 struct Theme {
     D2D1_COLOR_F bg, text1, text2, text3, textDisabled;
-    D2D1_COLOR_F shell, shellLine, coreTop, coreBottom, coreHighlight, hair, dashed;   // the double-bordered cards
+    D2D1_COLOR_F card, cardLine, dashed;
     D2D1_COLOR_F ghost, ghostHover, ghostLine;
-    D2D1_COLOR_F accent, accent2, accentHover, accentInk, accentTint, accentLine;
+    D2D1_COLOR_F accent, accentHover, accentInk, accentTint, accentLine;
     D2D1_COLOR_F warn, warnTint, warnLine, danger, dangerTint, dangerLine;
-    D2D1_COLOR_F track, smoke;
+    D2D1_COLOR_F track;
 };
 
-enum class Font { Caption, Body, BodyStrong, Brand, Subtitle, Title, Mono, MonoStrong, MonoLarge, Icon16, Icon20, Icon28 };
+enum class Font { Caption, Body, BodyStrong, Subtitle, Title, Mono, Icon16, Icon20, Icon28 };
 enum class Align { Left, Center, Right };
 
 class Gfx {
@@ -36,11 +37,11 @@ public:
     float Scale() const { return dpi_ / 96.0f; }
 
     void Fill(const D2D1_RECT_F& r, D2D1_COLOR_F c, float radius = 0);
-    void Gradient(const D2D1_RECT_F& r, D2D1_COLOR_F from, D2D1_COLOR_F to, float radius = 0, bool vertical = false);
-    void Glow(D2D1_POINT_2F center, float radius, D2D1_COLOR_F c);   // soft light fading out from the centre
     void Stroke(const D2D1_RECT_F& r, D2D1_COLOR_F c, float radius = 0, float width = 1, bool dashed = false);
     void Line(D2D1_POINT_2F a, D2D1_POINT_2F b, D2D1_COLOR_F c, float width = 1);
     void Circle(D2D1_POINT_2F c, float r, D2D1_COLOR_F fill);
+    // A smooth curve through `pts` (left to right) with the area under it filled, fading downwards.
+    void Area(const D2D1_RECT_F& r, const std::vector<D2D1_POINT_2F>& pts, D2D1_COLOR_F line, D2D1_COLOR_F fill);
     // Draws text in `r`, wrapped or cut off with an ellipsis. Returns the height used.
     float Text(const std::wstring& s, Font f, const D2D1_RECT_F& r, D2D1_COLOR_F c, Align a = Align::Left,
                bool wrap = false);
@@ -69,7 +70,7 @@ private:
     ComPtr<IDWriteFontCollection> fonts_;   // the embedded fonts, or null for the system's
     ComPtr<ID2D1HwndRenderTarget> rt_;
     ComPtr<ID2D1SolidColorBrush> brush_;
-    ComPtr<ID2D1StrokeStyle> dash_;
-    ComPtr<IDWriteTextFormat> formats_[12];
+    ComPtr<ID2D1StrokeStyle> dash_, round_;
+    ComPtr<IDWriteTextFormat> formats_[9];
     std::wstring sans_, mono_, icons_;
 };

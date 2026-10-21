@@ -27,20 +27,21 @@ namespace {
 
 constexpr UINT WM_APP_ANALYSIS = WM_APP + 1;   // lParam: AnalysisResult*
 constexpr UINT WM_APP_DONE = WM_APP + 2;       // lParam: RunResult*
-constexpr UINT_PTR kTick = 1;                  // progress refresh while extracting
+constexpr UINT WM_APP_FIT = WM_APP + 3;        // wParam: client height wanted, in pixels
+constexpr UINT_PTR kTick = 1;                  // frames while extracting
 constexpr UINT_PTR kAnim = 2;                  // busy bar while a zip is read
 constexpr double GiB = 1024.0 * 1024 * 1024;
 
 // Segoe Fluent Icons / Segoe MDL2 Assets
-constexpr wchar_t kGlyphDownload[] = L"\xE896", kGlyphFolder[] = L"\xE8B7", kGlyphBack[] = L"\xE72B",
+constexpr wchar_t kGlyphDownload[] = L"\xE896", kGlyphFolder[] = L"\xE8B7", kGlyphDrive[] = L"\xEDA2",
                   kGlyphCheck[] = L"\xE73E", kGlyphError[] = L"\xEB90", kGlyphWarning[] = L"\xE7BA",
-                  kGlyphPause[] = L"\xE769", kGlyphPlay[] = L"\xE768", kGlyphArrow[] = L"\xE72A";
+                  kGlyphPause[] = L"\xE769", kGlyphPlay[] = L"\xE768", kGlyphArrow[] = L"\xE72A",
+                  kGlyphClose[] = L"\xE711";
 
 enum class Screen { Home, Reading, Ready, Running, End };
 enum class EndKind { Done, Stopped, Problem, CantOpen };
-enum class Modal { None, Start, Stop };
-enum Id { kNone, kBrowse, kBack, kChange, kCancel, kExtract, kPause, kStop, kOpen, kAnother, kResume, kRetry, kNo, kYes };
-enum class Kind { Primary, Warn, Ghost, Icon };
+enum Id { kNone, kBrowse, kChange, kCancel, kExtract, kPause, kStop, kOpen, kAnother, kResume, kRetry };
+enum class Kind { Primary, Ghost, Icon };
 enum class Tone { Good, Warn, Bad };
 
 struct Hit { int id; D2D1_RECT_F r; bool enabled; };
@@ -52,7 +53,6 @@ Gfx g_gfx;
 Microsoft::WRL::ComPtr<ITaskbarList3> g_taskbar;
 
 Screen g_screen = Screen::Home;
-Modal g_modal = Modal::None;
 EndKind g_end = EndKind::Done;
 std::wstring g_endText, g_zip, g_zipDest;   // the zip being read, and the folder asked for
 Analysis g_a;
@@ -66,15 +66,25 @@ bool g_running = false, g_paused = false, g_closing = false;
 std::mutex g_mu;
 Progress g_shared;                 // written by the worker
 Progress g_prog;                   // the window's copy
-std::deque<std::pair<ULONGLONG, uint64_t>> g_samples;
+// The speed graph runs on its own clock and shows the last half minute sliding left at a steady
+// pace, so the curve only ever moves sideways. The clock stops while paused.
+struct Sample { double t, rate; uint64_t bytes; };
+std::deque<Sample> g_samples;                      // one every quarter second of run time
+double g_clock = 0;                                // seconds extracting, not counting pauses
+ULONGLONG g_clockAt = 0;
+double g_rate = 0;                                 // a slower average, for the time remaining
+double g_shownRate = 0;                            // the speed in the graph's corner
+double g_top = 0;                                  // top of the graph, easing towards the visible peak
+constexpr double kStep = .25, kSpan = 30;
+constexpr double kDelay = 2 * kStep;               // the tip trails two samples behind, so it never has to guess
 int g_titlePct = -1;
 
 std::vector<Hit> g_hits;
 int g_hover = kNone, g_press = kNone, g_focus = kNone;
 bool g_keyboard = false;           // show the focus ring only after Tab
-float g_scroll = 0, g_scrollMax = 0, g_view = 0;
-bool g_dragging = false;           // dragging the scroll thumb
-float g_dragFrom = 0, g_dragScroll = 0;
+int g_fitAsked = 0;
+struct Drive { std::wstring name; uint64_t free, total; };
+std::vector<Drive> g_drives;       // fixed drives, shown on the home screen                // last height asked for, so a clamped window isn't asked again
 
 // ---- text ------------------------------------------------------------------------
 
@@ -127,51 +137,50 @@ std::wstring Compact(const std::wstring& path, float width) {
     return out;
 }
 
-std::wstring VolumeName() { return g_a.volume.empty() ? L"the drive" : g_a.volume; }
+// "C:" reads better as "C Drive".
+std::wstring DriveName(const std::wstring& vol) {
+    if (vol.size() >= 2 && vol[1] == L':') return std::wstring(1, wchar_t(towupper(vol[0]))) + L" Drive";
+    return vol.empty() ? L"the drive" : vol;
+}
+
+std::wstring VolumeName() { return DriveName(g_a.volume); }
 
 // ---- drawing pieces ----------------------------------------------------------------
 
+constexpr float kWidth = 520;   // the window's fixed width; its height follows what's on screen
+constexpr float kPad = 24;
+constexpr float kButtonH = 36;
+
 D2D1_RECT_F R(float x, float y, float w, float h) { return D2D1::RectF(x, y, x + w, y + h); }
 
-// A card: a faint outer shell holding a darker panel, like a plate sitting in a tray.
-// Returns the inner panel.
 D2D1_RECT_F Card(const D2D1_RECT_F& r) {
-    const Theme& t = g_gfx.theme;
-    g_gfx.Fill(r, t.shell, 20);
-    g_gfx.Stroke(r, t.shellLine, 20);
-    D2D1_RECT_F in = {r.left + 6, r.top + 6, r.right - 6, r.bottom - 6};
-    g_gfx.Gradient(in, t.coreTop, t.coreBottom, 14, true);
-    g_gfx.Line({in.left + 14, in.top + 1}, {in.right - 14, in.top + 1}, t.coreHighlight);
-    return in;
+    g_gfx.Fill(r, g_gfx.theme.card, 12);
+    g_gfx.Stroke(r, g_gfx.theme.cardLine, 12);
+    return r;
 }
 
-constexpr float kButtonH = 44;
-
-float ButtonWidth(const std::wstring& label, Kind kind, bool glyph = false) {
+float ButtonWidth(const std::wstring& label, Kind kind) {
+    if (kind == Kind::Icon) return kButtonH;
     float text = g_gfx.TextWidth(label, Font::BodyStrong);
-    return kind == Kind::Primary || glyph ? 22 + text + 12 + 32 + 6 : 22 + text + 22;
+    return kind == Kind::Ghost ? 16 + text + 16 : 16 + text + 10 + 26 + 5;
 }
 
-// Pill buttons. A primary one, or one with a glyph, carries it in a small round tip on the right.
+// Pill buttons; a primary one carries an arrow in a small round tip on the right.
 void Button(int id, float x, float y, const std::wstring& label, Kind kind, bool enabled = true,
             const wchar_t* glyph = nullptr) {
     const Theme& t = g_gfx.theme;
-    bool tip = kind == Kind::Primary || kind == Kind::Warn || glyph;
-    float w = kind == Kind::Icon ? kButtonH : ButtonWidth(label, kind, glyph != nullptr);
-    D2D1_RECT_F r = R(x, y, w, kButtonH);
-    float dy = g_gfx.OffsetY();
-    g_hits.push_back({id, D2D1::RectF(r.left, r.top + dy, r.right, r.bottom + dy), enabled});
+    D2D1_RECT_F r = R(x, y, ButtonWidth(label, kind), kButtonH);
+    g_hits.push_back({id, r, enabled});
     bool hover = enabled && g_hover == id, press = hover && g_press == id;
     float radius = kButtonH / 2;
     if (press) r = D2D1::RectF(r.left + 1, r.top + 1, r.right - 1, r.bottom - 1);   // a slight press-in
-    D2D1_COLOR_F ink = t.text1, tipBg = D2D1::ColorF(1, 1, 1, .06f);
-    if (kind == Kind::Primary || kind == Kind::Warn) {
-        D2D1_COLOR_F bg = kind == Kind::Warn ? t.warn : hover ? t.accentHover : t.accent;
+    D2D1_COLOR_F ink = t.text1;
+    bool solid = kind == Kind::Primary;
+    if (solid) {
+        D2D1_COLOR_F bg = hover ? t.accentHover : t.accent;
         if (!enabled) bg.a = .3f;
         g_gfx.Fill(r, bg, radius);
-        g_gfx.Line({r.left + radius, r.top + 1}, {r.right - radius, r.top + 1}, D2D1::ColorF(1, 1, 1, enabled ? .45f : .1f));
         ink = t.accentInk;
-        tipBg = D2D1::ColorF(t.accentInk.r, t.accentInk.g, t.accentInk.b, .12f);
     } else {
         g_gfx.Fill(r, hover ? t.ghostHover : t.ghost, radius);
         g_gfx.Stroke(r, t.ghostLine, radius);
@@ -181,16 +190,26 @@ void Button(int id, float x, float y, const std::wstring& label, Kind kind, bool
     if (kind == Kind::Icon) {
         g_gfx.Text(glyph, Font::Icon16, R(r.left, r.top + (h - 16) / 2, r.right - r.left, 18), ink, Align::Center);
     } else {
-        g_gfx.Text(label, Font::BodyStrong, R(r.left + 22, r.top + (h - 20) / 2, r.right - r.left - 22, 20), ink);
-        if (tip) {
-            D2D1_POINT_2F c = {r.right - 6 - 16, r.top + h / 2};
-            float nudge = hover ? 1.5f : 0;   // the tip leans forward on hover
-            g_gfx.Circle({c.x + nudge, c.y}, 16, tipBg);
-            g_gfx.Text(glyph ? glyph : kGlyphArrow, Font::Icon16, R(c.x - 9 + nudge, c.y - 8, 18, 18), ink, Align::Center);
+        g_gfx.Text(label, Font::BodyStrong, R(r.left + 16, r.top + (h - 20) / 2, r.right - r.left - 16, 20), ink);
+        if (solid) {
+            D2D1_POINT_2F c = {r.right - 5 - 13 + (hover ? 1.5f : 0), r.top + h / 2};   // the tip leans forward on hover
+            g_gfx.Circle(c, 13, D2D1::ColorF(t.accentInk.r, t.accentInk.g, t.accentInk.b, .12f));
+            g_gfx.Text(kGlyphArrow, Font::Icon16, R(c.x - 9, c.y - 8, 18, 18), ink, Align::Center);
         }
     }
     if (g_keyboard && g_focus == id)
         g_gfx.Stroke(D2D1::RectF(r.left - 3, r.top - 3, r.right + 3, r.bottom + 3), t.accentLine, radius + 3, 2);
+}
+
+// A row of buttons ending at `right`, the last one primary.
+void Buttons(float right, float y, const std::vector<std::pair<int, std::wstring>>& buttons, Kind last, bool lastEnabled = true) {
+    auto kind = [&](size_t i) { return i + 1 == buttons.size() ? last : Kind::Ghost; };
+    float x = right + 8;
+    for (size_t i = 0; i < buttons.size(); i++) x -= ButtonWidth(buttons[i].second, kind(i)) + 8;
+    for (size_t i = 0; i < buttons.size(); i++) {   // left to right, so Tab goes the way they read
+        Button(buttons[i].first, x, y, buttons[i].second, kind(i), i + 1 == buttons.size() ? lastEnabled : true);
+        x += ButtonWidth(buttons[i].second, kind(i)) + 8;
+    }
 }
 
 // A coloured pill with a glyph, for the verdict and notices. Returns its height.
@@ -200,351 +219,292 @@ float Badge(float x, float y, Tone tone, const std::wstring& text) {
     const wchar_t* glyph = kGlyphCheck;
     if (tone == Tone::Warn) { fg = t.warn; tint = t.warnTint; line = t.warnLine; glyph = kGlyphWarning; }
     if (tone == Tone::Bad) { fg = t.danger; tint = t.dangerTint; line = t.dangerLine; glyph = kGlyphError; }
-    float w = g_gfx.TextWidth(text, Font::BodyStrong) + 34 + 14;
-    D2D1_RECT_F r = R(x, y, w, 30);
-    g_gfx.Fill(r, tint, 15);
-    g_gfx.Stroke(r, line, 15);
-    g_gfx.Text(glyph, Font::Icon16, R(x + 11, y + 7, 18, 18), fg);
-    g_gfx.Text(text, Font::BodyStrong, R(x + 34, y + 5, w - 34, 20), fg);
-    return 30;
+    D2D1_RECT_F r = R(x, y, g_gfx.TextWidth(text, Font::BodyStrong) + 28 + 12, 26);
+    g_gfx.Fill(r, tint, 13);
+    g_gfx.Stroke(r, line, 13);
+    g_gfx.Text(glyph, Font::Icon16, R(x + 9, y + 5, 18, 18), fg);
+    g_gfx.Text(text, Font::BodyStrong, R(x + 28, y + 3, r.right - x - 28, 20), fg);
+    return 26;
 }
 
 // A notice: a badge, and if there's more to say, a line of text under it.
 float Notice(float x, float y, float w, Tone tone, const std::wstring& title, const std::wstring& text) {
     float h = Badge(x, y, tone, title);
-    if (!text.empty()) h += 8 + g_gfx.Text(text, Font::Body, R(x + 4, y + h + 8, w - 4, 200), g_gfx.theme.text2, Align::Left, true);
+    if (!text.empty()) h += 6 + g_gfx.Text(text, Font::Body, R(x + 2, y + h + 6, w - 2, 200), g_gfx.theme.text2, Align::Left, true);
     return h;
 }
 
-// A row of figures in a card, each with a small label under it.
-void Figures(float x, float y, float w, const std::vector<std::pair<std::wstring, std::wstring>>& cells) {
-    D2D1_RECT_F in = Card(R(x, y, w, 92));
-    float cw = (in.right - in.left) / float(cells.size());
-    for (size_t i = 0; i < cells.size(); i++) {
-        float cx = in.left + cw * float(i);
-        if (i) g_gfx.Line({cx, in.top + 16}, {cx, in.bottom - 16}, g_gfx.theme.hair);
-        g_gfx.Text(cells[i].first, Font::MonoStrong, R(cx + 18, in.top + 16, cw - 28, 26), g_gfx.theme.text1);
-        g_gfx.Text(cells[i].second, Font::Caption, R(cx + 18, in.top + 46, cw - 28, 16), g_gfx.theme.text3);
+// Text in a few colours on one line, cut off with an ellipsis where it runs out of room.
+void Pieces(float x, float y, float w, const std::vector<std::pair<std::wstring, D2D1_COLOR_F>>& pieces) {
+    float right = x + w;
+    for (auto& [text, color] : pieces) {
+        float tw = g_gfx.TextWidth(text, Font::Body);
+        g_gfx.Text(text, Font::Body, R(x, y, std::min(tw + 1, right - x), 20), color);
+        x += tw;
+        if (x >= right) break;
     }
 }
 
-// The ZeroZip mark: a mint tile with an opened zipper.
-void Mark(float x, float y) {
-    const Theme& t = g_gfx.theme;
-    g_gfx.Gradient(R(x, y, 22, 22), t.accent2, t.accent, 6, true);
-    g_gfx.Fill(R(x + 10, y + 3, 2, 8), t.accentInk, 1);
-    g_gfx.Fill(R(x + 8.5f, y + 10, 5, 4), t.accentInk, 1.5f);
-    g_gfx.Line({x + 11, y + 14}, {x + 6.5f, y + 20}, t.accentInk, 1.6f);
-    g_gfx.Line({x + 11, y + 14}, {x + 15.5f, y + 20}, t.accentInk, 1.6f);
-}
-
-void Header(float W) {
-    const Theme& t = g_gfx.theme;
-    Mark(28, 21);
-    g_gfx.Text(L"ZeroZip", Font::Brand, R(58, 21, 120, 22), t.text1);
-    std::wstring status = L"Ready";
-    D2D1_COLOR_F dot = t.text3;
-    if (g_screen == Screen::Reading) status = L"Reading zip";
-    if (g_screen == Screen::Running) {
-        status = g_ex.Stopped() ? L"Stopping" : g_paused ? L"Paused" : L"Extracting · " + std::to_wstring(std::max(0, g_titlePct)) + L"%";
-        dot = g_paused || g_ex.Stopped() ? t.warn : t.accent;
-    }
-    if (g_screen == Screen::End) {
-        status = g_end == EndKind::Done ? L"Done" : g_end == EndKind::Stopped ? L"Stopped" : L"Needs attention";
-        dot = g_end == EndKind::Done ? t.accent : g_end == EndKind::Stopped ? t.warn : t.danger;
-    }
-    float sw = g_gfx.TextWidth(status, Font::Caption) + 34;
-    D2D1_RECT_F pill = R(W - 28 - sw, 18, sw, 28);
-    g_gfx.Fill(pill, t.shell, 14);
-    g_gfx.Stroke(pill, t.shellLine, 14);
-    g_gfx.Circle({pill.left + 14, pill.top + 14}, 3.5f, dot);
-    g_gfx.Text(status, Font::Caption, R(pill.left + 24, pill.top + 6, sw - 24, 16), g_running ? t.text1 : t.text2);
+void Detail(float x, float y, float w, const std::wstring& label, const std::wstring& value) {
+    g_gfx.Text(label, Font::Body, R(x, y, 130, 20), g_gfx.theme.text3);
+    g_gfx.Text(value, Font::Body, R(x + 130, y, w - 130, 20), g_gfx.theme.text1);
 }
 
 // ---- screens ---------------------------------------------------------------------------
 
 bool CanExtract() { return g_a.problemCount == 0 && g_a.minFree >= int64_t(g_a.margin) && g_reading == 0; }
 
-constexpr float kTop = 92;   // where page content starts, below the header
-
-struct Column { float x, w; };
-
-Column Content(float W) {
-    float w = std::min(640.f, W - 64);
-    return {std::floor((W - w) / 2), w};
-}
-
-float DrawHome(float W, float H) {
+float DrawHome(float W) {
     const Theme& t = g_gfx.theme;
-    float w = std::min(560.f, W - 64), h = 280, x = std::floor((W - w) / 2);
-    float y = std::max(kTop, std::floor(64 + (H - 64 - h) / 2 - 16));
-    D2D1_RECT_F in = Card(R(x, y, w, h));
-    g_gfx.Stroke(D2D1::RectF(in.left + 10, in.top + 10, in.right - 10, in.bottom - 10), t.dashed, 10, 1, true);
-    float cx = x + w / 2, ty = y + 54;
-    D2D1_RECT_F tile = R(cx - 32, ty, 64, 64);
-    g_gfx.Fill(tile, t.accentTint, 18);
-    g_gfx.Stroke(tile, t.accentLine, 18);
-    g_gfx.Text(kGlyphDownload, Font::Icon28, R(tile.left, ty + 17, 64, 32), t.accent, Align::Center);
-    g_gfx.Text(L"Drop a zip here", Font::Subtitle, R(x, ty + 86, w, 28), t.text1, Align::Center);
+    float w = W - 2 * kPad;
+    D2D1_RECT_F in = Card(R(kPad, kPad, w, 196));
+    g_gfx.Stroke(D2D1::RectF(in.left + 8, in.top + 8, in.right - 8, in.bottom - 8), t.dashed, 8, 1, true);
+    float cx = kPad + w / 2, y = kPad + 28;
+    D2D1_RECT_F tile = R(cx - 26, y, 52, 52);
+    g_gfx.Fill(tile, t.accentTint, 15);
+    g_gfx.Stroke(tile, t.accentLine, 15);
+    g_gfx.Text(kGlyphDownload, Font::Icon28, R(tile.left, y + 11, 52, 32), t.accent, Align::Center);
+    g_gfx.Text(L"Drop a zip here", Font::Subtitle, R(kPad, y + 64, w, 28), t.text1, Align::Center);
     std::wstring choose = L"Choose zip";
-    Button(kBrowse, cx - ButtonWidth(choose, Kind::Primary) / 2, ty + 132, choose, Kind::Primary);
+    Button(kBrowse, cx - ButtonWidth(choose, Kind::Primary) / 2, y + 104, choose, Kind::Primary);
+    y = kPad + 196;
+    if (g_drives.empty()) return y;
+    y += 12;
+    float h = 12 + float(g_drives.size()) * 46 + 2;
+    Card(R(kPad, y, w, h));
+    float ry = y + 14, bx = kPad + 46, bw = w - 46 - 18;
+    for (auto& d : g_drives) {
+        float used = 1 - float(double(d.free) / double(d.total));
+        g_gfx.Text(kGlyphDrive, Font::Icon16, R(kPad + 18, ry + 2, 18, 18), t.text2);
+        g_gfx.Text(d.name, Font::BodyStrong, R(bx, ry, 140, 20), t.text1);
+        g_gfx.Text(Fmt(double(d.free)) + L" free of " + Fmt(double(d.total)), Font::Caption, R(bx, ry + 2, bw, 16), t.text2, Align::Right);
+        g_gfx.Fill(R(bx, ry + 26, bw, 4), t.track, 2);
+        g_gfx.Fill(R(bx, ry + 26, std::max(4.f, bw * used), 4), used > .9f ? t.warn : t.accent, 2);
+        ry += 46;
+    }
     return y + h;
 }
 
 void BusyBar(float x, float y, float w) {
     const Theme& t = g_gfx.theme;
-    g_gfx.Fill(R(x, y, w, 8), t.track, 4);
+    g_gfx.Fill(R(x, y, w, 6), t.track, 3);
     float phase = float((GetTickCount64() - g_animStart) % 1600) / 1600.f;
     float seg = w * .32f, pos = -seg + phase * (w + seg);
     float a = std::max(x, x + pos), b = std::min(x + w, x + pos + seg);
-    if (b > a) g_gfx.Gradient(D2D1::RectF(a, y, b, y + 8), t.accent, t.accent2, 4);
+    if (b > a) g_gfx.Fill(D2D1::RectF(a, y, b, y + 6), t.accent, 3);
 }
 
 float DrawReading(float W) {
-    auto [x, w] = Content(W);
-    g_gfx.Text(Leaf(g_zip), Font::Title, R(x, kTop, w, 40), g_gfx.theme.text1);
-    g_gfx.Text(L"Reading the zip…", Font::Body, R(x, kTop + 44, w, 20), g_gfx.theme.text2);
-    BusyBar(x, kTop + 84, w);
-    Button(kCancel, x, kTop + 116, L"Cancel", Kind::Ghost);
-    return kTop + 160;
+    float w = W - 2 * kPad;
+    g_gfx.Text(Leaf(g_zip), Font::Subtitle, R(kPad, kPad, w, 28), g_gfx.theme.text1);
+    g_gfx.Text(L"Reading the zip\u2026", Font::Body, R(kPad, kPad + 32, w, 20), g_gfx.theme.text2);
+    BusyBar(kPad, kPad + 66, w);
+    Buttons(W - kPad, kPad + 92, {{kCancel, L"Cancel"}}, Kind::Ghost);
+    return kPad + 92 + kButtonH;
 }
 
 float DrawReady(float W) {
     const Theme& t = g_gfx.theme;
     const Analysis& a = g_a;
-    auto [x, w] = Content(W);
-    float y = kTop;
-    Button(kBack, x - 4, y, L"", Kind::Icon, true, kGlyphBack);
-    g_gfx.Text(Leaf(a.zip), Font::Title, R(x + 52, y - 2, w - 52, 40), t.text1);
-    g_gfx.Text(Fmt(double(a.zipBytes)) + L" → " + Fmt(double(a.unpacked)) + L"  ·  " + Plural(a.files, L"file", L"files"),
-               Font::Mono, R(x + 54, y + 38, w - 54, 18), t.text2);
-    y += 80;
+    float x = kPad, w = W - 2 * kPad, y = kPad;
+    g_gfx.Text(Leaf(a.zip), Font::Subtitle, R(x, y, w, 28), t.text1);
+    g_gfx.Text(Fmt(double(a.zipBytes)) + L" \u2192 " + Fmt(double(a.unpacked)) + L"  \u00b7  " + Plural(a.files, L"file", L"files"),
+               Font::Mono, R(x, y + 32, w, 18), t.text2);
+    y += 66;
 
     std::wstring vol = VolumeName();
     if (a.problemCount) {
         std::wstring msg;
         for (size_t i = 0; i < std::min<size_t>(a.problems.size(), 3); i++)
             msg += (i ? L"\n" : L"") + Leaf(a.problems[i].name) + L": " + a.problems[i].reason;
-        y += Notice(x, y, w, Tone::Bad, L"Can't extract this zip", msg) + 14;
+        y += Notice(x, y, w, Tone::Bad, L"Can't extract this zip", msg) + 10;
     } else if (a.minFree >= int64_t(a.margin)) {
-        y += Notice(x, y, w, Tone::Good, L"Fits on " + vol, L"") + 14;
+        y += Notice(x, y, w, Tone::Good, L"Fits on " + vol, L"") + 10;
     } else {
         y += Notice(x, y, w, Tone::Warn, L"Not enough space",
-                    L"Free up " + Fmt(double(int64_t(a.margin) - a.minFree)) + L" more on " + vol + L".") + 14;
+                    L"Free up " + Fmt(double(int64_t(a.margin) - a.minFree)) + L" more on " + vol + L".") + 10;
     }
     if (!a.lost.empty())
-        y += Notice(x, y, w, Tone::Warn, Leaf(a.lost) + L" was lost last time and will be skipped", L"") + 14;
+        y += Notice(x, y, w, Tone::Warn, Leaf(a.lost) + L" was lost last time and will be skipped", L"") + 10;
     else if (a.resuming)
-        y += Notice(x, y, w, Tone::Good, L"Continuing where it stopped", L"") + 14;
+        y += Notice(x, y, w, Tone::Good, L"Continuing where it stopped", L"") + 10;
     if (!a.sameVolume)
         y += Notice(x, y, w, Tone::Warn, L"The zip and the folder are on different drives",
-                    L"The folder's drive needs room for every file.") + 14;
+                    L"The folder's drive needs room for every file.") + 10;
     if (a.punchFiles) {
         std::wstring names;
         for (auto& n : a.punchNames) names += (names.empty() ? L"" : L", ") + Leaf(n);
-        if (a.punchFiles > a.punchNames.size()) names += L"…";
-        y += Notice(x, y, w, Tone::Warn, Plural(a.punchFiles, L"file is", L"files are") + L" bigger than the free space", names) + 14;
+        if (a.punchFiles > a.punchNames.size()) names += L"\u2026";
+        y += Notice(x, y, w, Tone::Warn, Plural(a.punchFiles, L"file is", L"files are") + L" bigger than the free space",
+                    names + L". Their zip data is freed as they extract, so a power cut during one loses that file.") + 10;
     }
     y += 6;
 
     std::wstring change = L"Change";
     float cw = ButtonWidth(change, Kind::Ghost);
-    D2D1_RECT_F in = Card(R(x, y, w, 92));
-    g_gfx.Text(kGlyphFolder, Font::Icon20, R(in.left + 20, in.top + 29, 24, 24), t.text2);
-    g_gfx.Text(L"Extract to", Font::Caption, R(in.left + 56, in.top + 18, w - 120 - cw, 16), t.text3);
-    g_gfx.Text(Compact(a.dest, in.right - in.left - 100 - cw), Font::Mono, R(in.left + 56, in.top + 38, in.right - in.left - 90 - cw, 18), t.text1);
-    Button(kChange, in.right - 18 - cw, in.top + 18, change, Kind::Ghost);
-    y += 92 + 24;
+    D2D1_RECT_F in = Card(R(x, y, w, 72));
+    float pathW = in.right - in.left - 52 - cw - 24;
+    g_gfx.Text(kGlyphFolder, Font::Icon20, R(in.left + 16, in.top + 20, 24, 24), t.text2);
+    g_gfx.Text(L"Extract to", Font::Caption, R(in.left + 50, in.top + 12, pathW, 16), t.text3);
+    g_gfx.Text(Compact(a.dest, pathW * .85f), Font::Mono, R(in.left + 50, in.top + 32, pathW, 18), t.text1);
+    Button(kChange, in.right - 14 - cw, in.top + (in.bottom - in.top - kButtonH) / 2, change, Kind::Ghost);
+    y += 72 + 18;
 
-    std::wstring extract = L"Extract";
-    float ew = ButtonWidth(extract, Kind::Primary), nw = ButtonWidth(L"Cancel", Kind::Ghost);
-    Button(kExtract, x + w - ew, y, extract, Kind::Primary, CanExtract());
-    Button(kCancel, x + w - ew - 10 - nw, y, L"Cancel", Kind::Ghost);
+    g_gfx.Text(L"The zip is deleted as it extracts.", Font::Caption, R(x, y + 10, w - 200, 16), t.text3);
+    Buttons(W - kPad, y, {{kCancel, L"Cancel"}, {kExtract, L"Extract"}}, Kind::Primary, CanExtract());
     return y + kButtonH;
+}
+
+// The speed at time `t` on the graph's clock, along a Catmull-Rom curve through the samples.
+double SpeedAt(double t) {
+    size_t n = g_samples.size();
+    double f = (t - g_samples[0].t) / kStep;
+    size_t i = size_t(std::clamp(f, 0.0, double(n - 2)));
+    double u = std::clamp(f - double(i), 0.0, 1.0);
+    double p0 = g_samples[i ? i - 1 : 0].rate, p1 = g_samples[i].rate, p2 = g_samples[i + 1].rate;
+    double p3 = g_samples[std::min(i + 2, n - 1)].rate;
+    double v = .5 * (2 * p1 + (p2 - p0) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u * u + (3 * p1 - p0 - 3 * p2 + p3) * u * u * u);
+    return std::max(v, 0.0);
+}
+
+bool GraphReady() { return g_samples.size() >= 3 && g_clock > kDelay; }
+
+// The last half minute of speed, scrolling like Task Manager's graphs.
+void SpeedGraph(const D2D1_RECT_F& box) {
+    const Theme& t = g_gfx.theme;
+    D2D1_RECT_F in = Card(box);
+    D2D1_RECT_F r = D2D1::RectF(in.left + 12, in.top + 10, in.right - 12, in.bottom - 10);
+    D2D1_RECT_F plot = D2D1::RectF(r.left, r.top + 24, r.right, r.bottom);   // room for the speed above the curve
+    double tip = g_clock - kDelay;
+    double left = tip - kSpan;   // now is always at the right edge, so the start comes in from the right
+    float px = (r.right - r.left) / float(kSpan);
+    for (int i = 1; i < 4; i++) {
+        float gy = plot.top + (plot.bottom - plot.top) * float(i) / 4;
+        g_gfx.Line({r.left, gy}, {r.right, gy}, D2D1::ColorF(1, 1, 1, .035f));
+    }
+    for (double gt = std::ceil(left / 3) * 3; gt < left + kSpan; gt += 3)   // grid lines move with the curve
+        if (gt > left) g_gfx.Line({r.left + float(gt - left) * px, plot.top}, {r.left + float(gt - left) * px, r.bottom}, D2D1::ColorF(1, 1, 1, .035f));
+    if (!GraphReady() || g_top == 0) {
+        if (!g_paused) g_gfx.Text(L"Measuring speed\u2026", Font::Caption, R(r.left, r.top, r.right - r.left, 16), t.text3);
+        return;
+    }
+    auto at = [&](double tt, double v) {
+        return D2D1::Point2F(r.left + float(tt - left) * px, plot.bottom - float(std::min(v / g_top, 1.0)) * (plot.bottom - plot.top));
+    };
+    // Points fall on fixed times along the curve, so from one frame to the next they only slide.
+    std::vector<D2D1_POINT_2F> pts;
+    double t0 = g_samples[0].t + std::max(0.0, std::floor((left - g_samples[0].t) / kStep)) * kStep;
+    for (int j = 0;; j++) {
+        double tt = t0 + j * kStep / 4;
+        if (tt >= tip) break;
+        pts.push_back(at(tt, SpeedAt(tt)));
+    }
+    D2D1_POINT_2F end = at(tip, SpeedAt(tip));
+    pts.push_back(end);
+    D2D1_COLOR_F line = g_paused ? t.warn : t.accent;
+    g_gfx.PushClip(r);
+    g_gfx.Area(plot, pts, line, D2D1::ColorF(line.r, line.g, line.b, .16f));
+    g_gfx.PopClip();
+    g_gfx.Circle(end, 4.5f, t.card);
+    g_gfx.Circle(end, 3, line);
+    if (g_paused) g_gfx.Text(L"Paused", Font::Caption, R(r.left, r.top, r.right - r.left, 16), t.warn);
+    else g_gfx.Text(Fmt(g_shownRate) + L"/s", Font::Caption, R(r.left, r.top, r.right - r.left, 16), t.text1);
 }
 
 float DrawRunning(float W) {
     const Theme& t = g_gfx.theme;
     const Progress& p = g_prog;
-    auto [x, w] = Content(W);
-    bool stopping = g_ex.Stopped();
-    float y = kTop;
-    g_gfx.Text(stopping ? L"Stopping after this file" : g_paused ? L"Paused" : L"Extracting", Font::Title, R(x, y, w, 40), t.text1);
-    g_gfx.Text(Leaf(g_a.zip), Font::Body, R(x, y + 42, w, 20), t.text2);
-    y += 80;
+    float x = kPad, w = W - 2 * kPad, y = kPad;
+    std::wstring dest = Leaf(g_a.dest);
+    Pieces(x, y, w, {{L"Extracting " + Plural(g_a.files, L"file", L"files") + L" from ", t.text2}, {Leaf(g_a.zip), t.accent},
+                     {L" to ", t.text2}, {dest.empty() ? g_a.dest : dest, t.accent}});
+    y += 30;
 
-    double frac = p.bytesTotal ? double(p.bytesDone) / double(p.bytesTotal) : p.total ? double(p.done) / double(p.total) : 0;
-    frac = std::clamp(frac, 0.0, 1.0);
-    wchar_t pct[16];
-    double shown = frac * 100;
+    double shown = p.bytesTotal ? std::clamp(double(p.bytesDone) / double(p.bytesTotal), 0.0, 1.0) * 100 : 0;
     if (shown >= 99.95 && p.done < p.total) shown = 99.9;
-    swprintf_s(pct, shown < 10 ? L"%.1f" : L"%.0f", shown);
-    D2D1_RECT_F in = Card(R(x, y, w, 196));
-    float ix = in.left + 24, iw = in.right - in.left - 48;
-    float pw = g_gfx.TextWidth(pct, Font::MonoLarge);
-    g_gfx.Text(pct, Font::MonoLarge, R(ix - 4, in.top + 14, pw + 4, 84), t.text1);
-    g_gfx.Text(L"%", Font::Subtitle, R(ix + pw + 2, in.top + 26, 30, 28), t.text2);
-    D2D1_COLOR_F from = g_paused ? D2D1::ColorF(0.78f, 0.6f, 0.23f) : t.accent, to = g_paused ? t.warn : t.accent2;
-    std::wstring state = g_paused ? L"Paused" : p.verifying ? L"Checking" : p.punching ? L"Freeing as it goes" : L"Extracting";
-    float sw = g_gfx.TextWidth(state, Font::Caption) + 20;
-    D2D1_RECT_F chip = R(ix, in.top + 108, sw, 22);
-    g_gfx.Fill(chip, g_paused ? t.warnTint : t.accentTint, 11);
-    g_gfx.Stroke(chip, g_paused ? t.warnLine : t.accentLine, 11);
-    g_gfx.Text(state, Font::Caption, R(chip.left + 10, chip.top + 3, sw - 10, 16), g_paused ? t.warn : t.accent);
-    g_gfx.Text(p.current.empty() ? L"Starting…" : Leaf(p.current), Font::Mono, R(ix + sw + 12, in.top + 110, iw - sw - 12, 18), t.text2);
-    D2D1_RECT_F track = R(ix, in.top + 146, iw, 10);
-    g_gfx.Fill(track, t.track, 5);
-    if (frac > 0) g_gfx.Gradient(R(ix, track.top, std::max(10.f, iw * float(frac)), 10), from, to, 5);
-    y += 196 + 12;
+    wchar_t pct[32];
+    swprintf_s(pct, shown < 10 ? L"%.1f%% complete" : L"%.0f%% complete", shown);
+    bool stopping = g_ex.Stopped();
+    g_gfx.Text(stopping ? L"Stopping after this file" : pct, Font::Title, R(x, y, w - 100, 40), t.text1);
+    Button(kPause, W - kPad - 2 * kButtonH - 8, y + 2, L"", Kind::Icon, !stopping, g_paused ? kGlyphPlay : kGlyphPause);
+    Button(kStop, W - kPad - kButtonH, y + 2, L"", Kind::Icon, !stopping, kGlyphClose);
+    y += 50;
 
-    std::wstring speed = L"–", left = L"–";
-    if (g_samples.size() > 1) {
-        auto& f = g_samples.front();
-        auto& l = g_samples.back();
-        double dt = double(l.first - f.first) / 1000.0;
-        double rate = dt > .5 ? double(l.second - f.second) / dt : 0;
-        if (rate > 0) {
-            speed = Fmt(rate) + L"/s";
-            left = Words(uint64_t(double(p.bytesTotal - std::min(p.bytesTotal, p.bytesDone)) / rate * 1000));
-        }
-    }
-    if (g_paused) left = L"Paused";
-    Figures(x, y, w, {{speed, L"Speed"}, {left, L"Time left"}, {Fmt(double(p.freeBytes)), L"Free on " + VolumeName()}});
-    y += 92 + 24;
+    SpeedGraph(R(x, y, w, 150));
+    y += 150 + 14;
 
-    std::wstring pause = g_paused ? L"Resume" : L"Pause";
-    float sw2 = ButtonWidth(L"Stop", Kind::Ghost), pw2 = ButtonWidth(pause, Kind::Ghost, true);
-    Button(kPause, x + w - sw2 - 10 - pw2, y, pause, Kind::Ghost, !stopping, g_paused ? kGlyphPlay : kGlyphPause);
-    Button(kStop, x + w - sw2, y, L"Stop", Kind::Ghost, !stopping);
-    return y + kButtonH;
+    std::wstring left = g_paused ? L"Paused" : L"Calculating\u2026";
+    if (!g_paused && g_rate > 0 && g_samples.size() > 3)
+        left = Words(uint64_t(double(p.bytesTotal - std::min(p.bytesTotal, p.bytesDone)) / g_rate * 1000));
+    std::wstring state = p.verifying ? L"  (checking)" : p.punching ? L"  (freeing as it goes)" : L"";
+    Detail(x, y, w, L"Name:", (p.current.empty() ? L"Starting\u2026" : Leaf(p.current)) + state);
+    Detail(x, y + 24, w, L"Time remaining:", left);
+    Detail(x, y + 48, w, L"Items remaining:", Num(p.total - std::min(p.total, p.done)) + L" (" +
+                                                 Fmt(double(p.bytesTotal - std::min(p.bytesTotal, p.bytesDone))) + L")");
+    Detail(x, y + 72, w, L"Free space:", Fmt(double(p.freeBytes)) + L" on " + VolumeName());
+    return y + 72 + 20;
 }
 
-float DrawEnd(float W, float H) {
+float DrawEnd(float W) {
     const Theme& t = g_gfx.theme;
-    float w = std::min(520.f, W - 64), x = std::floor((W - w) / 2);
-    D2D1_COLOR_F fg = t.accent, tint = t.accentTint, line = t.accentLine;
+    float x = kPad, w = W - 2 * kPad, y = kPad;
+    D2D1_COLOR_F fg = t.accent, tint = t.accentTint;
     const wchar_t* glyph = kGlyphCheck;
     std::wstring title;
     std::vector<std::pair<int, std::wstring>> buttons;
     switch (g_end) {
         case EndKind::Done:
             title = L"Done";
-            buttons = {{kOpen, L"Open folder"}, {kAnother, L"Extract another"}};
+            buttons = {{kAnother, L"Extract another"}, {kOpen, L"Open folder"}};
             break;
         case EndKind::Stopped:
-            fg = t.warn; tint = t.warnTint; line = t.warnLine; glyph = kGlyphPause;
+            fg = t.warn; tint = t.warnTint; glyph = kGlyphPause;
             title = L"Stopped";
-            buttons = {{kResume, L"Resume"}, {kAnother, L"Close"}};
+            buttons = {{kAnother, L"Close"}, {kResume, L"Resume"}};
             break;
         case EndKind::Problem:
-            fg = t.danger; tint = t.dangerTint; line = t.dangerLine; glyph = kGlyphWarning;
+            fg = t.danger; tint = t.dangerTint; glyph = kGlyphWarning;
             title = L"Stopped";
-            buttons = {{kResume, L"Resume"}, {kAnother, L"Close"}};
+            buttons = {{kAnother, L"Close"}, {kResume, L"Resume"}};
             break;
         case EndKind::CantOpen:
-            fg = t.danger; tint = t.dangerTint; line = t.dangerLine; glyph = kGlyphError;
+            fg = t.danger; tint = t.dangerTint; glyph = kGlyphError;
             title = L"Can't open this zip";
-            buttons = {{kRetry, L"Try again"}, {kAnother, L"Choose another zip"}};
+            buttons = {{kAnother, L"Choose another zip"}, {kRetry, L"Try again"}};
             break;
     }
-    float height = 76 + 28 + 44 + g_gfx.TextHeight(g_endText, Font::Body, w) + 32 + kButtonH;
-    float y = std::max(kTop, std::floor(64 + (H - 64 - height) / 2 - 16));
-    D2D1_POINT_2F c = {x + w / 2, y + 38};
-    g_gfx.Glow(c, 90, D2D1::ColorF(fg.r, fg.g, fg.b, .12f));
-    g_gfx.Circle(c, 38, tint);
-    D2D1_RECT_F ring = D2D1::RectF(c.x - 38, c.y - 38, c.x + 38, c.y + 38);
-    g_gfx.Stroke(ring, line, 38);
-    g_gfx.Text(glyph, Font::Icon28, R(c.x - 20, c.y - 15, 40, 32), fg, Align::Center);
-    y += 76 + 28;
-    g_gfx.Text(title, Font::Title, R(x, y, w, 40), t.text1, Align::Center);
-    y += 44;
-    y += g_gfx.Text(g_endText, Font::Body, R(x, y, w, 200), t.text2, Align::Center, true) + 32;
-    float total = 0;
-    for (size_t i = 0; i < buttons.size(); i++) total += ButtonWidth(buttons[i].second, i == 0 ? Kind::Primary : Kind::Ghost) + 10;
-    float bx = x + (w - total + 10) / 2;
-    for (size_t i = 0; i < buttons.size(); i++) {
-        Kind kind = i == 0 ? Kind::Primary : Kind::Ghost;
-        Button(buttons[i].first, bx, y, buttons[i].second, kind);
-        bx += ButtonWidth(buttons[i].second, kind) + 10;
-    }
+    D2D1_POINT_2F c = {x + 22, y + 22};
+    g_gfx.Circle(c, 22, tint);
+    g_gfx.Text(glyph, Font::Icon20, R(c.x - 12, c.y - 11, 24, 24), fg, Align::Center);
+    g_gfx.Text(title, Font::Subtitle, R(x + 60, y, w - 60, 28), t.text1);
+    float th = g_gfx.Text(g_endText, Font::Body, R(x + 60, y + 30, w - 60, 200), t.text2, Align::Left, true);
+    y = std::max(y + 44, y + 30 + th) + 22;
+    Buttons(W - kPad, y, buttons, Kind::Primary);
     return y + kButtonH;
-}
-
-void DrawModal(float W, float H) {
-    const Theme& t = g_gfx.theme;
-    g_hits.clear();   // only the dialog takes input
-    g_gfx.Fill(D2D1::RectF(0, 0, W, H), t.smoke);
-    float w = std::min(460.f, W - 48), x = std::floor((W - w) / 2), tw = w - 12 - 56;
-    std::wstring title, text, yes, no;
-    if (g_modal == Modal::Start) {
-        title = L"Extract and delete the zip?";
-        text = L"The zip is used up as it extracts and is gone when it's done.";
-        if (g_a.punchFiles)
-            text += L" If the PC loses power while one of the " + Plural(g_a.punchFiles, L"big file", L"big files") +
-                    L" is being extracted, that file is lost.";
-        yes = L"Extract";
-        no = L"Cancel";
-    } else {
-        title = L"Stop extracting?";
-        text = L"You can pick up where it stopped by opening the zip again.";
-        if (g_prog.punching) text += L" The file being extracted now is finished first.";
-        yes = L"Stop";
-        no = L"Keep going";
-    }
-    float textH = g_gfx.TextHeight(text, Font::Body, tw);
-    float h = 12 + 28 + 28 + 12 + textH + 28 + kButtonH + 28, y = std::floor((H - h) / 2);
-    D2D1_RECT_F in = Card(R(x, y, w, h));
-    float ix = in.left + 28;
-    g_gfx.Text(title, Font::Subtitle, R(ix, in.top + 28, tw, 28), t.text1);
-    g_gfx.Text(text, Font::Body, R(ix, in.top + 68, tw, textH + 4), t.text2, Align::Left, true);
-    Kind kind = g_modal == Modal::Start ? Kind::Primary : Kind::Warn;
-    float yw = ButtonWidth(yes, kind), nw = ButtonWidth(no, Kind::Ghost), by = in.bottom - 28 - kButtonH;
-    Button(kYes, in.right - 28 - yw, by, yes, kind);
-    Button(kNo, in.right - 28 - yw - 10 - nw, by, no, Kind::Ghost);
 }
 
 void Paint() {
     if (!g_gfx.Begin()) return;
     g_hits.clear();
     D2D1_SIZE_F size = g_gfx.Size();
-    float W = size.width, H = size.height;
-    g_view = H;
-    if (g_scroll > g_scrollMax) g_scroll = g_scrollMax;
-    const Theme& t = g_gfx.theme;
-    g_gfx.Glow({W * .05f, -H * .15f}, std::max(W, H) * .55f, D2D1::ColorF(t.accent.r, t.accent.g, t.accent.b, .10f));
-    g_gfx.Glow({W * 1.0f, H * 1.1f}, std::max(W, H) * .5f, D2D1::ColorF(t.accent2.r, t.accent2.g, t.accent2.b, .06f));
-
-    g_gfx.Translate(-g_scroll);
-    Header(W);
+    float W = size.width;
     float bottom = 0;
     switch (g_screen) {
-        case Screen::Home: bottom = DrawHome(W, H); break;
+        case Screen::Home: bottom = DrawHome(W); break;
         case Screen::Reading: bottom = DrawReading(W); break;
         case Screen::Ready: bottom = DrawReady(W); break;
         case Screen::Running: bottom = DrawRunning(W); break;
-        case Screen::End: bottom = DrawEnd(W, H); break;
+        case Screen::End: bottom = DrawEnd(W); break;
     }
-    g_gfx.Translate(g_scroll);
-    // Only the visible part of a scrolled button can be clicked.
-    for (auto& h : g_hits) {
-        h.r.top = std::max(h.r.top, 0.f);
-        h.r.bottom = std::min(h.r.bottom, H);
-    }
-    g_hits.erase(std::remove_if(g_hits.begin(), g_hits.end(), [](const Hit& h) { return h.r.bottom <= h.r.top; }),
-                 g_hits.end());
-
-    float scrollMax = std::max(0.f, bottom + 28 - H);
-    if (scrollMax != g_scrollMax) {
-        g_scrollMax = scrollMax;
-        if (g_scroll > g_scrollMax) InvalidateRect(g_hwnd, nullptr, FALSE);   // content got shorter: draw again in range
-    }
-    if (g_scrollMax > 0) {
-        float thumb = std::max(32.f, H * H / (H + g_scrollMax));
-        float top = (H - thumb) * (g_scroll / g_scrollMax);
-        g_gfx.Fill(R(W - (g_dragging ? 7.f : 5.f), top + 2, g_dragging ? 4.f : 2.f, thumb - 4), t.text3, 2);
-    }
-    if (g_modal != Modal::None) DrawModal(W, H);
     g_gfx.End();
+    // The window is as tall as its content, like a copy dialog.
+    int want = int(std::ceil((bottom + kPad) * g_gfx.Scale()));
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    if (want != rc.bottom && want != g_fitAsked) {
+        g_fitAsked = want;
+        PostMessageW(g_hwnd, WM_APP_FIT, WPARAM(want), 0);
+    }
 }
 
 // ---- window chrome -------------------------------------------------------------------
@@ -568,22 +528,34 @@ void SetTaskbar(TBPFLAG state, uint64_t done = 0, uint64_t total = 0) {
     if (total && state != TBPF_NOPROGRESS) g_taskbar->SetProgressValue(g_hwnd, done, total);
 }
 
+void LoadDrives() {
+    g_drives.clear();
+    DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26 && g_drives.size() < 4; i++) {
+        if (!(mask & (1u << i))) continue;
+        wchar_t root[] = {wchar_t(L'A' + i), L':', L'\\', 0};
+        ULARGE_INTEGER avail{}, total{};
+        if (GetDriveTypeW(root) == DRIVE_FIXED && GetDiskFreeSpaceExW(root, &avail, &total, nullptr) && total.QuadPart)
+            g_drives.push_back({DriveName(std::wstring(root, 2)), avail.QuadPart, total.QuadPart});
+    }
+}
+
 void Go(Screen s) {
     if (s == Screen::Home) {
+        LoadDrives();
         g_readSeq++;   // a read still going is no longer wanted
         KillTimer(g_hwnd, kAnim);
         if (!g_running) SetTaskbar(TBPF_NOPROGRESS);
     }
     g_screen = s;
-    g_scroll = 0;
     g_focus = kNone;
     g_hover = g_press = kNone;
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
-void SetTitle(const std::wstring& suffix) {
-    std::wstring t = L"ZeroZip";
-    if (!suffix.empty()) t += L" – " + suffix;
+// "42% Game.zip" while extracting, like a download manager; just the name otherwise.
+void SetTitle(const std::wstring& prefix) {
+    std::wstring t = prefix.empty() ? L"ZeroZip" : prefix + L" " + Leaf(g_a.zip);
     SetWindowTextW(g_hwnd, t.c_str());
 }
 
@@ -639,16 +611,45 @@ void Pull() {
         g_prog = g_shared;
     }
     ULONGLONG now = GetTickCount64();
-    if (!g_paused) g_samples.push_back({now, g_prog.bytesDone});
-    while (g_samples.size() > 2 && now - g_samples.front().first > 5000) g_samples.pop_front();
-    if (g_prog.bytesTotal) {
-        SetTaskbar(g_paused ? TBPF_PAUSED : TBPF_NORMAL, g_prog.bytesDone, g_prog.bytesTotal);
-        int pct = int(double(g_prog.bytesDone) * 100 / double(g_prog.bytesTotal));
-        if (pct != g_titlePct || g_paused) {
-            g_titlePct = pct;
-            SetTitle(g_paused ? L"Paused" : std::to_wstring(pct) + L"%");
+    double dt = g_clockAt ? std::min(.25, double(now - g_clockAt) / 1000.0) : 0;
+    g_clockAt = now;
+    if (!g_paused && g_prog.bytesTotal) {
+        if (g_samples.empty()) g_samples.push_back({0, 0, g_prog.bytesDone});
+        g_clock += dt;
+        if (g_clock >= g_samples.back().t + kStep) {
+            // Speed over the last second, eased a little: progress comes in 4 MB steps,
+            // so anything shorter jumps around.
+            const Sample& from = g_samples[g_samples.size() - std::min<size_t>(4, g_samples.size())];
+            Sample next{g_samples.back().t + kStep, 0, g_prog.bytesDone};
+            double avg = double(next.bytes - std::min(next.bytes, from.bytes)) / (next.t - from.t);
+            double prev = g_samples.back().rate;
+            next.rate = g_samples.size() == 1 ? avg : prev + (avg - prev) * (1 - std::exp(-kStep / .25));
+            if (g_samples.size() == 1) g_samples[0].rate = avg;   // start level, not with a climb from nothing
+            g_rate = g_rate == 0 ? avg : g_rate + (avg - g_rate) * (1 - std::exp(-kStep / 3));
+            g_samples.push_back(next);
+            while (g_samples.size() > 8 && g_samples[1].t < g_clock - kDelay - kSpan - kStep) g_samples.pop_front();
+            if (GraphReady()) g_shownRate = SpeedAt(g_clock - kDelay);
         }
     }
+    if (g_prog.bytesTotal) {
+        int pct = int(double(g_prog.bytesDone) * 100 / double(g_prog.bytesTotal));
+        if (g_paused ? g_titlePct != -2 : pct != g_titlePct) {   // only when it changes; this runs every frame
+            g_titlePct = g_paused ? -2 : pct;
+            SetTaskbar(g_paused ? TBPF_PAUSED : TBPF_NORMAL, g_prog.bytesDone, g_prog.bytesTotal);
+            SetTitle(g_paused ? L"Paused" : std::to_wstring(pct) + L"%");   // e.g. "42% Game.zip"
+        }
+    }
+}
+
+// The graph's height follows the highest speed on screen: it makes room quickly and settles back slowly.
+void Animate() {
+    if (!GraphReady()) return;
+    double tip = g_clock - kDelay, peak = SpeedAt(tip);
+    for (auto& p : g_samples)
+        if (p.t >= tip - kSpan && p.t <= tip) peak = std::max(peak, p.rate);
+    double want = std::max(peak * 1.25, 1048576.0);
+    if (g_top == 0) g_top = want;
+    else g_top += (want - g_top) * (want > g_top ? .1 : .015);
 }
 
 void StartRun() {
@@ -657,6 +658,8 @@ void StartRun() {
     g_paused = false;
     g_prog = Progress();
     g_samples.clear();
+    g_clock = g_rate = g_shownRate = g_top = 0;
+    g_clockAt = 0;
     g_titlePct = -1;
     {
         std::lock_guard<std::mutex> l(g_mu);
@@ -665,7 +668,7 @@ void StartRun() {
     g_ex.Reset();
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);   // don't let the PC sleep mid-run
     ShutdownBlockReasonCreate(g_hwnd, L"ZeroZip is extracting a zip");
-    SetTimer(g_hwnd, kTick, 100, nullptr);
+    SetTimer(g_hwnd, kTick, 33, nullptr);   // 30 fps while extracting
     Go(Screen::Running);
     std::wstring zip = g_a.zip, dest = g_a.dest;
     g_worker = std::thread([zip, dest] {
@@ -697,10 +700,9 @@ void OnDone(RunResult* r) {
     Pull();
     g_running = false;
     g_paused = false;
-    g_modal = Modal::None;
     SetTaskbar(r->ok || r->stopped ? TBPF_NOPROGRESS : TBPF_ERROR, 1, 1);
     if (r->ok) {
-        ShowEnd(EndKind::Done, L"Extracted to " + Compact(g_a.dest, 330));
+        ShowEnd(EndKind::Done, L"Extracted to " + Compact(g_a.dest, 290));
     } else if (r->stopped) {
         ShowEnd(EndKind::Stopped, L"Open the zip again any time to continue.");
     } else {
@@ -751,7 +753,6 @@ void Click(int id) {
             if (!z.empty()) Read(z, L"");
             break;
         }
-        case kBack:
         case kCancel:
         case kAnother: Go(Screen::Home); break;   // also abandons a read in progress
         case kChange: {
@@ -759,30 +760,22 @@ void Click(int id) {
             if (!d.empty()) Read(g_a.zip, d);
             break;
         }
-        case kExtract: g_modal = Modal::Start; g_focus = kNone; break;
+        case kExtract:
+            if (CanExtract()) StartRun();
+            break;
         case kPause:
             g_paused = !g_paused;
             g_ex.Pause(g_paused);
-            g_samples.clear();   // speed restarts from here
             g_titlePct = -1;
             Pull();
             break;
-        case kStop: g_modal = Modal::Stop; g_focus = kNone; break;
+        case kStop:   // nothing is lost by stopping, so it doesn't ask
+            g_paused = false;
+            g_ex.Stop();
+            break;
         case kOpen: ShellExecuteW(g_hwnd, L"open", g_a.dest.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
         case kResume: Read(g_a.zip, g_a.dest); break;
         case kRetry: Read(g_zip, g_zipDest); break;
-        case kYes:
-            if (g_modal == Modal::Start) {
-                if (!CanExtract()) break;   // a read is still finishing; the dialog stays up
-                g_modal = Modal::None;
-                StartRun();
-            } else {
-                g_modal = Modal::None;
-                g_paused = false;
-                g_ex.Stop();
-            }
-            break;
-        case kNo: g_modal = Modal::None; break;
     }
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
@@ -794,27 +787,11 @@ int HitAt(LPARAM lp) {
     return kNone;
 }
 
-void ScrollTo(float y) {
-    g_scroll = std::clamp(y, 0.f, g_scrollMax);
-    InvalidateRect(g_hwnd, nullptr, FALSE);
-}
-
-void RefreshHover() {
-    POINT p;
-    GetCursorPos(&p);
-    ScreenToClient(g_hwnd, &p);
-    g_hover = HitAt(MAKELPARAM(p.x, p.y));
-}
-
-bool OnScrollbar(LPARAM lp) {
-    float s = g_gfx.Scale();
-    return g_scrollMax > 0 && float(GET_X_LPARAM(lp)) / s >= g_gfx.Size().width - 14 && float(GET_Y_LPARAM(lp)) / s < g_view;
-}
-
+// Enter presses the screen's obvious next step, but never Extract: that deletes the zip,
+// so it takes a click or an explicit Tab to it.
 int DefaultButton() {
-    if (g_modal != Modal::None) return kYes;
     for (auto& h : g_hits)
-        if (h.enabled && (h.id == kBrowse || h.id == kExtract || h.id == kOpen || h.id == kResume || h.id == kRetry)) return h.id;
+        if (h.enabled && (h.id == kBrowse || h.id == kOpen || h.id == kResume || h.id == kRetry)) return h.id;
     return kNone;
 }
 
@@ -848,13 +825,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_gfx.Resize();
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
-        case WM_GETMINMAXINFO: {
+        case WM_APP_FIT: {
             UINT dpi = GetDpiForWindow(hwnd);
+            RECT r{0, 0, MulDiv(int(kWidth), int(dpi), 96), int(wp)};
+            AdjustWindowRectExForDpi(&r, DWORD(GetWindowLongW(hwnd, GWL_STYLE)), FALSE, DWORD(GetWindowLongW(hwnd, GWL_EXSTYLE)), dpi);
+            RECT cur;
+            GetWindowRect(hwnd, &cur);
             MONITORINFO mi{sizeof mi};
             GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-            auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
-            mm->ptMinTrackSize = {std::min<LONG>(MulDiv(600, int(dpi), 96), mi.rcWork.right - mi.rcWork.left),
-                                  std::min<LONG>(MulDiv(440, int(dpi), 96), mi.rcWork.bottom - mi.rcWork.top)};
+            int h = std::min<int>(r.bottom - r.top, mi.rcWork.bottom - mi.rcWork.top);
+            int top = std::max<int>(mi.rcWork.top, std::min<int>(cur.top, mi.rcWork.bottom - h));   // keep it on screen
+            SetWindowPos(hwnd, nullptr, cur.left, top, r.right - r.left, h, SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         }
         case WM_DPICHANGED: {
@@ -864,11 +845,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_MOUSEMOVE: {
-            if (g_dragging) {
-                float travel = g_view - std::max(32.f, g_view * g_view / (g_view + g_scrollMax));
-                if (travel > 0) ScrollTo(g_dragScroll + (float(GET_Y_LPARAM(lp)) / g_gfx.Scale() - g_dragFrom) * g_scrollMax / travel);
-                return 0;
-            }
             int id = HitAt(lp);
             if (id != g_hover) {
                 g_hover = id;
@@ -884,24 +860,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_LBUTTONDOWN:
             g_keyboard = false;
-            if (g_modal == Modal::None && OnScrollbar(lp)) {
-                g_dragging = true;
-                g_dragFrom = float(GET_Y_LPARAM(lp)) / g_gfx.Scale();
-                g_dragScroll = g_scroll;
-                SetCapture(hwnd);
-                return 0;
-            }
             g_press = HitAt(lp);
             if (g_press) SetCapture(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_LBUTTONUP: {
-            if (g_dragging) {
-                g_dragging = false;
-                ReleaseCapture();
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
             int id = HitAt(lp), pressed = g_press;
             g_press = kNone;
             ReleaseCapture();
@@ -911,40 +874,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_CAPTURECHANGED:
             g_press = kNone;
-            g_dragging = false;
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
-        case WM_MOUSEWHEEL:
-            if (g_modal == Modal::None) {
-                ScrollTo(g_scroll - float(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * 64);
-                RefreshHover();
-            }
-            return 0;
         case WM_KEYDOWN:
-            if (lp & 0x40000000) {
-                // held keys repeat; only scrolling should, never a button
-                if (wp != VK_DOWN && wp != VK_UP && wp != VK_NEXT && wp != VK_PRIOR) return 0;
-            }
-            if (g_modal == Modal::None && (wp == VK_DOWN || wp == VK_UP || wp == VK_NEXT || wp == VK_PRIOR || wp == VK_HOME || wp == VK_END)) {
-                float page = std::max(64.f, g_view - 64);
-                ScrollTo(wp == VK_HOME ? 0 : wp == VK_END ? g_scrollMax
-                         : g_scroll + (wp == VK_DOWN ? 48 : wp == VK_UP ? -48 : wp == VK_NEXT ? page : -page));
-            } else if (wp == VK_TAB) {
+            if (lp & 0x40000000) return 0;   // a held key repeats; never let that press a button
+            if (wp == VK_TAB) {
                 MoveFocus(GetKeyState(VK_SHIFT) < 0);
             } else if (wp == VK_RETURN || wp == VK_SPACE) {
                 int id = g_keyboard && g_focus ? g_focus : wp == VK_RETURN ? DefaultButton() : int(kNone);
                 if (id) Click(id);
             } else if (wp == VK_ESCAPE) {
-                if (g_modal != Modal::None) Click(kNo);
-                else if (g_screen == Screen::Ready || g_screen == Screen::End || g_screen == Screen::Reading) Go(Screen::Home);
-            } else if (wp == 'O' && GetKeyState(VK_CONTROL) < 0 && !g_running && g_modal == Modal::None) {
+                if (g_screen == Screen::Ready || g_screen == Screen::End || g_screen == Screen::Reading) Go(Screen::Home);
+            } else if (wp == 'O' && GetKeyState(VK_CONTROL) < 0 && !g_running) {
                 Click(kBrowse);
             }
             return 0;
         case WM_DROPFILES: {
             UINT n = DragQueryFileW(HDROP(wp), 0, nullptr, 0);
             std::wstring path(n, L'\0');
-            if (!g_running && g_modal == Modal::None && n && DragQueryFileW(HDROP(wp), 0, path.data(), n + 1)) {
+            if (!g_running && n && DragQueryFileW(HDROP(wp), 0, path.data(), n + 1)) {
                 SetForegroundWindow(hwnd);
                 Read(path, L"");
             }
@@ -952,7 +900,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_TIMER:
-            if (wp == kTick && g_running) Pull();
+            if (wp == kTick && g_running) {
+                Pull();
+                Animate();
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_APP_ANALYSIS:
@@ -972,7 +923,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // The window closes once the run has stopped; a file being freed as it
                 // goes is finished first, which can take a while.
                 g_closing = true;
-                g_modal = Modal::None;
                 g_ex.Stop();
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
@@ -1012,12 +962,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     RegisterClassExW(&wc);
 
     UINT dpi = GetDpiForSystem();
-    int w = MulDiv(920, int(dpi), 96), h = MulDiv(640, int(dpi), 96);
+    constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;   // a fixed-size dialog-like window
+    RECT size{0, 0, MulDiv(int(kWidth), int(dpi), 96), MulDiv(244, int(dpi), 96)};
+    AdjustWindowRectExForDpi(&size, style, FALSE, WS_EX_ACCEPTFILES, dpi);
+    int w = size.right - size.left, h = size.bottom - size.top;
     RECT work;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    w = std::min<int>(w, work.right - work.left);
-    h = std::min<int>(h, work.bottom - work.top);
-    g_hwnd = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"ZeroZip", WS_OVERLAPPEDWINDOW,
+    g_hwnd = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"ZeroZip", style,
                              work.left + (work.right - work.left - w) / 2, work.top + (work.bottom - work.top - h) / 2, w,
                              h, nullptr, nullptr, inst, nullptr);
     if (!g_hwnd || !g_gfx.Init(g_hwnd, inst, IDR_FONT_SANS, IDR_FONT_MONO)) return 1;
@@ -1032,6 +983,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (argv && argc > 1) Read(argv[1], L"");
     LocalFree(argv);
 
+    LoadDrives();
     ShowWindow(g_hwnd, show);
     UpdateWindow(g_hwnd);
     MSG m;
