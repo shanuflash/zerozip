@@ -1,0 +1,5 @@
+build/
+ZeroZip.exe
+*.obj
+*.res
+tests/__pycache__/
