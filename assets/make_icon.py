@@ -1,5 +1,5 @@
-"""Draws the ZeroZip icon into zerozip.ico: a blue archive with its zipper
-partly opened, in the Windows 11 icon style. Pure Python, needs nothing installed:
+"""Draws the ZeroZip icon into zerozip.ico: a mint archive with its zipper
+partly opened. Pure Python, needs nothing installed:
     python assets/make_icon.py"""
 import math, os, struct, zlib
 
@@ -30,9 +30,9 @@ def mix(a, b, t):
     return [a[i] + (b[i] - a[i]) * t for i in range(3)]
 
 
-TOP, BOTTOM = (86, 176, 255), (30, 98, 232)
-INSIDE_TOP, INSIDE_BOTTOM = (16, 52, 140), (10, 36, 104)
-LIGHT = (240, 248, 255)
+TOP, BOTTOM = (94, 234, 212), (40, 200, 140)          # the mint/teal brand gradient
+INSIDE_TOP, INSIDE_BOTTOM = (6, 46, 36), (4, 28, 22)
+LIGHT = (240, 255, 250)
 
 
 def sample(x, y, detail):
@@ -74,10 +74,10 @@ def sample(x, y, detail):
     if sl < 0 or (tab < 0 and hole > 0):
         col = [255, 255, 255]
     elif min(sl, tab) < 0.012:
-        col = mix(col, (8, 40, 110), 0.35)
+        col = mix(col, (4, 40, 30), 0.35)
     # top highlight and a thin darker rim at the bottom
     if d > -0.018:
-        col = mix(col, (255, 255, 255) if y < cy else (10, 40, 120), 0.18)
+        col = mix(col, (255, 255, 255) if y < cy else (6, 60, 44), 0.18)
     edge_a = max(0.0, min(1.0, -d * 220))
     out = [out[i] * (1 - edge_a) + col[i] * edge_a for i in range(3)]
     return out, a * (1 - edge_a) + edge_a

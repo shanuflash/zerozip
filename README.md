@@ -65,9 +65,7 @@ Only zip for now. RAR could be extracted in place too: front to back with hole p
 
 Windows 10 or 11 (x64). Nothing to install: ZeroZip is one small exe.
 
-The window is drawn natively with Direct2D in the Windows 11 style:
-- Mica, Segoe UI Variable, and your accent color and light or dark theme;
-- on Windows 10 it falls back to a solid background, Segoe UI and the Windows 10 icon font.
+The window is drawn natively with Direct2D and DirectWrite, in ZeroZip's own dark look with the Geist fonts built in. It looks the same on Windows 10 and 11.
 
 Measured on Windows 11, it uses about 16–20 MB of private memory while idle and about 32 MB while extracting.
 
@@ -94,8 +92,6 @@ Test switches, read from the environment:
 | Variable | Effect |
 |---|---|
 | `ZEROZIP_TEST_PUNCH_OVER=<bytes>` | Files at least this big use hole-punch mode, so it can be tested on a drive with plenty of space. |
-| `ZEROZIP_TEST_THEME=light` or `dark` | Ignore the Windows theme. |
-| `ZEROZIP_TEST_NO_MICA=1` | Use the solid Windows 10 background instead of Mica. |
 
 `tests/make_e2e_zip.py` builds a game-like zip, about 2.4 GB with `--big`, for trying the app by hand.
 
@@ -103,16 +99,17 @@ Test switches, read from the environment:
 
 ```
 src/engine.*      zip index, space planning, extract + truncate / hole punching
-src/gfx.*         Direct2D / DirectWrite drawing with the Windows 11 colors and type
+src/gfx.*         Direct2D / DirectWrite drawing in the ZeroZip style, with the embedded fonts
 src/main.cpp      the window, its screens and input, and the engine on a worker thread
 third_party/      zstd (decoder) and miniz (inflate)
 tests/            engine tests
-assets/           the icon and the script that draws it
+assets/           the icon, the script that draws it, and the fonts
 ```
 
 ## Credits
 
 - [Zstandard](https://github.com/facebook/zstd) (BSD)
 - [miniz](https://github.com/richgel999/miniz) (MIT)
+- [Geist](https://vercel.com/font) and Geist Mono fonts (SIL OFL 1.1)
 
-Their licenses are next to each in `third_party/`.
+Their licenses are next to each in `third_party/` and `assets/fonts/`.

@@ -2,6 +2,8 @@
 #include "resource.h"
 
 IDI_APP ICON "..\\assets\\zerozip.ico"
+IDR_FONT_SANS RCDATA "..\\assets\\fonts\\Geist-Variable.woff2"
+IDR_FONT_MONO RCDATA "..\\assets\\fonts\\GeistMono-Variable.woff2"
 
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "zerozip.manifest"
 
