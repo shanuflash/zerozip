@@ -63,7 +63,15 @@ Only zip for now. RAR could be extracted in place too: front to back with hole p
 
 ## Requirements
 
-Windows 10 or 11 (x64), plus the Microsoft Edge WebView2 Runtime, which ships with Windows 11 and is on most Windows 10 PCs.
+Windows 10 or 11 (x64). Nothing to install: ZeroZip is one small exe.
+
+The window is drawn natively with Direct2D in the Windows 11 style:
+- Mica, Segoe UI Variable, and your accent color and light or dark theme;
+- on Windows 10 it falls back to a solid background, Segoe UI and the Windows 10 icon font.
+
+Measured on Windows 11, it uses about 16–20 MB of private memory while idle and about 32 MB while extracting.
+
+Not done yet: screen readers can't read the window, and High Contrast themes aren't followed.
 
 ## Building
 
@@ -81,25 +89,30 @@ build.bat test
 python tests\run_tests.py
 ```
 
-`tests/e2e.mjs` drives the real app window over the WebView2 DevTools protocol. See the comment at its top. Setting `ZEROZIP_TEST_PUNCH_OVER=<bytes>` forces hole-punch mode for files at least that big, so it can be tested on a drive with plenty of space.
+Test switches, read from the environment:
 
-While working on the UI, set `ZEROZIP_UI=<repo>\ui` to serve the page from disk instead of the copy built into the exe. Set `ZEROZIP_DEV=1` to enable DevTools. Opening `ui/index.html` in a browser runs it in demo mode with made-up data.
+| Variable | Effect |
+|---|---|
+| `ZEROZIP_TEST_PUNCH_OVER=<bytes>` | Files at least this big use hole-punch mode, so it can be tested on a drive with plenty of space. |
+| `ZEROZIP_TEST_THEME=light` or `dark` | Ignore the Windows theme. |
+| `ZEROZIP_TEST_NO_MICA=1` | Use the solid Windows 10 background instead of Mica. |
+
+`tests/make_e2e_zip.py` builds a game-like zip, about 2.4 GB with `--big`, for trying the app by hand.
 
 ## Layout
 
 ```
 src/engine.*      zip index, space planning, extract + truncate / hole punching
-src/main.cpp      window, WebView2 host, UI bridge
-ui/index.html     the whole interface
-third_party/      zstd (decoder), miniz (inflate), WebView2 SDK
-tests/            engine tests and the end-to-end driver
+src/gfx.*         Direct2D / DirectWrite drawing with the Windows 11 colors and type
+src/main.cpp      the window, its screens and input, and the engine on a worker thread
+third_party/      zstd (decoder) and miniz (inflate)
+tests/            engine tests
+assets/           the icon and the script that draws it
 ```
 
 ## Credits
 
 - [Zstandard](https://github.com/facebook/zstd) (BSD)
 - [miniz](https://github.com/richgel999/miniz) (MIT)
-- [Geist](https://vercel.com/font) fonts (SIL OFL 1.1)
-- Microsoft WebView2 SDK (BSD)
 
-Their licenses are next to each in `third_party/` and `ui/fonts/`.
+Their licenses are next to each in `third_party/`.
