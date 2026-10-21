@@ -48,10 +48,6 @@ public:
                bool wrap = false);
     float TextHeight(const std::wstring& s, Font f, float width);   // wrapped
     float TextWidth(const std::wstring& s, Font f);
-    // A line chart of (0..1, value) points, optionally filled to the bottom.
-    void Chart(const D2D1_RECT_F& r, const std::vector<std::pair<double, double>>& pts, double lo, double hi,
-               D2D1_COLOR_F line, float width, bool fill);
-
     void PushClip(const D2D1_RECT_F& r);
     void PopClip();
     void Translate(float dy);   // shift everything drawn after this down by dy

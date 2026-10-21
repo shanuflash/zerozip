@@ -207,38 +207,6 @@ float Gfx::TextWidth(const std::wstring& s, Font f) {
     return m.widthIncludingTrailingWhitespace;
 }
 
-void Gfx::Chart(const D2D1_RECT_F& r, const std::vector<std::pair<double, double>>& pts, double lo, double hi,
-                D2D1_COLOR_F line, float width, bool fill) {
-    if (pts.size() < 2 || hi <= lo) return;
-    float w = r.right - r.left, h = r.bottom - r.top;
-    auto at = [&](const std::pair<double, double>& p) {
-        return D2D1::Point2F(r.left + float(p.first) * w, r.bottom - float((p.second - lo) / (hi - lo)) * h);
-    };
-    for (int pass = fill ? 0 : 1; pass < 2; pass++) {
-        ComPtr<ID2D1PathGeometry> geo;
-        ComPtr<ID2D1GeometrySink> sink;
-        d2d_->CreatePathGeometry(&geo);
-        geo->Open(&sink);
-        sink->BeginFigure(pass == 0 ? D2D1::Point2F(at(pts[0]).x, r.bottom) : at(pts[0]),
-                          pass == 0 ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW);
-        for (auto& p : pts) sink->AddLine(at(p));
-        if (pass == 0) sink->AddLine(D2D1::Point2F(at(pts.back()).x, r.bottom));
-        sink->EndFigure(pass == 0 ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
-        sink->Close();
-        if (pass == 0) {
-            D2D1_GRADIENT_STOP stops[] = {{0, {line.r, line.g, line.b, .24f}}, {1, {line.r, line.g, line.b, 0}}};
-            ComPtr<ID2D1GradientStopCollection> coll;
-            ComPtr<ID2D1LinearGradientBrush> grad;
-            rt_->CreateGradientStopCollection(stops, 2, &coll);
-            rt_->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, r.top), D2D1::Point2F(0, r.bottom)),
-                                           coll.Get(), &grad);
-            rt_->FillGeometry(geo.Get(), grad.Get());
-        } else {
-            rt_->DrawGeometry(geo.Get(), Brush(line), width);
-        }
-    }
-}
-
 void Gfx::PushClip(const D2D1_RECT_F& r) { rt_->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED); }
 void Gfx::PopClip() { rt_->PopAxisAlignedClip(); }
 

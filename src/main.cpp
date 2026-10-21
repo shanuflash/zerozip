@@ -33,11 +33,9 @@ constexpr double GiB = 1024.0 * 1024 * 1024;
 
 // Segoe Fluent Icons / Segoe MDL2 Assets
 constexpr wchar_t kGlyphDownload[] = L"\xE896", kGlyphFolder[] = L"\xE8B7", kGlyphBack[] = L"\xE72B",
-                  kGlyphShield[] = L"\xEA18", kGlyphDrive[] = L"\xEDA2", kGlyphResume[] = L"\xE72C",
                   kGlyphCheck[] = L"\xE73E", kGlyphDone[] = L"\xEC61", kGlyphError[] = L"\xEB90",
                   kGlyphWarning[] = L"\xE7BA", kGlyphInfo[] = L"\xE946", kGlyphPause[] = L"\xE769",
-                  kGlyphPlay[] = L"\xE768", kGlyphCut[] = L"\xE8C6", kGlyphDelete[] = L"\xE74D",
-                  kGlyphFile[] = L"\xE8A5", kGlyphLost[] = L"\xEA39";
+                  kGlyphPlay[] = L"\xE768";
 
 enum class Screen { Home, Reading, Ready, Running, End };
 enum class EndKind { Done, Stopped, Problem, CantOpen };
@@ -47,7 +45,6 @@ enum class Kind { Standard, Accent, Subtle };
 enum class Bar { Info, Success, Caution, Critical };
 
 struct Hit { int id; D2D1_RECT_F r; bool enabled; };
-struct LogItem { std::wstring name; uint64_t size; FileResult result; };
 struct AnalysisResult { unsigned seq; bool ok; Analysis a; std::wstring err; };
 struct RunResult { bool ok, stopped; std::wstring err; };
 
@@ -68,15 +65,10 @@ ULONGLONG g_animStart = 0;
 Extractor g_ex;
 std::thread g_worker;
 bool g_running = false, g_paused = false, g_closing = false;
-ULONGLONG g_started = 0;
 std::mutex g_mu;
 Progress g_shared;                 // written by the worker
-std::deque<LogItem> g_pending;     // finished files the window hasn't shown yet
 Progress g_prog;                   // the window's copy
-std::deque<LogItem> g_recent;
 std::deque<std::pair<ULONGLONG, uint64_t>> g_samples;
-std::vector<std::pair<double, double>> g_trace;
-uint64_t g_zipStart = 0, g_elapsed = 0;
 int g_titlePct = -1;
 
 std::vector<Hit> g_hits;
@@ -107,14 +99,6 @@ std::wstring Num(uint64_t n) {
     std::wstring s = std::to_wstring(n);
     for (int i = int(s.size()) - 3; i > 0; i -= 3) s.insert(size_t(i), 1, L',');
     return s;
-}
-
-std::wstring Clock(uint64_t ms) {
-    uint64_t s = ms / 1000, h = s / 3600, m = s / 60 % 60;
-    wchar_t b[32];
-    if (h) swprintf_s(b, L"%llu:%02llu:%02llu", h, m, s % 60);
-    else swprintf_s(b, L"%llu:%02llu", m, s % 60);
-    return b;
 }
 
 std::wstring Words(uint64_t ms) {
@@ -226,61 +210,6 @@ void Figures(float x, float y, float w, const std::vector<std::pair<std::wstring
     }
 }
 
-double NiceStep(double raw) {
-    static const double mb[] = {1, 2, 5, 10, 25, 50, 100, 250, 512, 1024};
-    static const double gb[] = {1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000, 2000, 5000};
-    if (raw < GiB)
-        for (double m : mb) if (m * 1048576 >= raw) return m * 1048576;
-    for (double v : gb) if (v * GiB >= raw) return v * GiB;
-    return 5000 * GiB;
-}
-
-// Free space over the run, as planned, with the 1 GB floor and optionally the live trace.
-void FreeChart(const D2D1_RECT_F& box, bool axes, const std::vector<std::pair<double, double>>* trace) {
-    const Theme& t = g_gfx.theme;
-    std::vector<std::pair<double, double>> pts;
-    for (auto& p : g_a.curve) pts.push_back({p.first, double(p.second)});
-    if (pts.size() < 2) return;
-    double vmax = double(g_a.freeBytes), vmin = pts[0].second;
-    for (auto& p : pts) { vmax = std::max(vmax, p.second); vmin = std::min(vmin, p.second); }
-    double hi = vmax * 1.08, lo = std::min(0.0, vmin), margin = double(g_a.margin);
-    if (vmin > margin * 3 && vmax - vmin < vmax * 0.08) {   // nearly flat: zoom in
-        double span = std::max(vmax - vmin, 16.0 * 1048576);
-        hi = vmax + span * .8;
-        lo = std::max(0.0, vmin - span * 1.6);
-    }
-    D2D1_RECT_F r = axes ? D2D1::RectF(box.left + 60, box.top + 8, box.right, box.bottom - 22) : box;
-    auto Y = [&](double v) { return r.bottom - float((v - lo) / (hi - lo)) * (r.bottom - r.top); };
-    if (axes) {
-        double step = NiceStep((hi - lo) / 4);
-        for (double v = std::ceil(lo / step) * step; v <= hi + 1; v += step) {
-            g_gfx.Line({r.left, Y(v)}, {r.right, Y(v)}, t.divider);
-            std::wstring label = v != 0 ? Fmt(v, step < GiB && std::fabs(v) >= GiB ? 1 : 0) : L"0";
-            g_gfx.Text(label, Font::Caption, R(box.left, Y(v) - 8, 52, 16), t.text3, Align::Right);
-        }
-        g_gfx.Text(L"Start", Font::Caption, R(r.left, r.bottom + 6, 80, 16), t.text3);
-        g_gfx.Text(L"Done", Font::Caption, R(r.right - 80, r.bottom + 6, 80, 16), t.text3, Align::Right);
-    }
-    if (margin >= lo) g_gfx.Line({r.left, Y(margin)}, {r.right, Y(margin)}, t.critical, 1, true);
-    g_gfx.Chart(r, pts, lo, hi, t.accent, trace ? 1.2f : 1.8f, true);
-    if (axes) {
-        auto low = *std::min_element(pts.begin(), pts.end(), [](auto& a, auto& b) { return a.second < b.second; });
-        D2D1_POINT_2F p = {r.left + float(low.first) * (r.right - r.left), Y(low.second)};
-        g_gfx.Circle(p, 4, t.accent);
-        g_gfx.Circle(p, 2, t.background);
-        std::wstring label = L"Lowest " + Fmt(low.second);
-        float lw = g_gfx.TextWidth(label, Font::Caption) + 2;
-        float lx = std::clamp(p.x - lw / 2, r.left, r.right - lw);
-        float ly = p.y + 10 + 16 > r.bottom ? p.y - 26 : p.y + 10;
-        g_gfx.Text(label, Font::Caption, R(lx, ly, lw, 16), t.accent);
-    }
-    if (trace && trace->size() > 1) {
-        g_gfx.Chart(r, *trace, lo, hi, t.text1, 1.6f, false);
-        auto& last = trace->back();
-        g_gfx.Circle({r.left + float(last.first) * (r.right - r.left), Y(last.second)}, 3.5f, t.text1);
-    }
-}
-
 void Footer(float W, float H) {
     g_gfx.Fill(D2D1::RectF(0, H - 64, W, H), g_gfx.theme.footer);
     g_gfx.Line({0, H - 64 + .5f}, {W, H - 64 + .5f}, g_gfx.theme.divider);
@@ -293,46 +222,22 @@ bool CanExtract() { return g_a.problemCount == 0 && g_a.minFree >= int64_t(g_a.m
 struct Column { float x, w; };
 
 Column Content(float W) {
-    float w = std::min(1000.f, W - 80);
+    float w = std::min(720.f, W - 64);
     return {std::floor((W - w) / 2), w};
 }
 
-float DrawHome(float W) {
+float DrawHome(float W, float H) {
     const Theme& t = g_gfx.theme;
-    auto [x, w] = Content(W);
-    float y = 28;
-    g_gfx.Text(L"Extract a zip", Font::Title, R(x, y, w, 40), t.text1);
-    y += 44;
-    y += g_gfx.Text(L"Unpack a big zip on a drive that's nearly full. ZeroZip writes files from the end of the zip and gives "
-                L"the zip's space back as each one is saved.",
-                Font::Body, R(x, y, std::min(w, 640.f), 60), t.text2, Align::Left, true) + 24;
-
-    D2D1_RECT_F drop = R(x, y, w, 232);
+    float w = std::min(560.f, W - 64), h = 240, x = std::floor((W - w) / 2), y = std::max(32.f, std::floor((H - h) / 2 - 12));
+    D2D1_RECT_F drop = R(x, y, w, h);
     g_gfx.Fill(drop, t.card, 8);
     g_gfx.Stroke(drop, t.dashed, 8, 1, true);
-    g_gfx.Text(kGlyphDownload, Font::Icon40, R(x, y + 36, w, 44), t.accent, Align::Center);
-    g_gfx.Text(L"Drag a zip file here", Font::Subtitle, R(x, y + 92, w, 28), t.text1, Align::Center);
-    g_gfx.Text(L"or", Font::Body, R(x, y + 124, w, 20), t.text2, Align::Center);
-    std::wstring browse = L"Browse for a zip…";
+    g_gfx.Text(kGlyphDownload, Font::Icon40, R(x, y + 48, w, 44), t.accent, Align::Center);
+    g_gfx.Text(L"Drop a zip here", Font::Subtitle, R(x, y + 108, w, 28), t.text1, Align::Center);
+    std::wstring browse = L"Browse…";
     float bw = ButtonWidth(browse);
-    Button(kBrowse, R(x + (w - bw) / 2, y + 156, bw, 32), browse, Kind::Accent);
-    y += 232 + 32;
-
-    g_gfx.Text(L"How it works", Font::BodyStrong, R(x, y, w, 20), t.text1);
-    y += 28;
-    struct Row { const wchar_t* glyph; const wchar_t* title; const wchar_t* text; } rows[] = {
-        {kGlyphDrive, L"Needs a fraction of the free space", L"Only the files being written need room; the zip shrinks as they land."},
-        {kGlyphShield, L"Nothing is removed until it's checked", L"Each file is CRC-checked and saved before its part of the zip is cut off."},
-        {kGlyphResume, L"Stop any time", L"Open the zip again later and ZeroZip picks up where it stopped."},
-    };
-    for (auto& row : rows) {
-        Card(R(x, y, w, 68));
-        g_gfx.Text(row.glyph, Font::Icon20, R(x + 20, y + 24, 24, 22), t.text1);
-        g_gfx.Text(row.title, Font::Body, R(x + 60, y + 14, w - 80, 20), t.text1);
-        g_gfx.Text(row.text, Font::Caption, R(x + 60, y + 36, w - 80, 16), t.text2);
-        y += 72;
-    }
-    return y + 20;
+    Button(kBrowse, R(x + (w - bw) / 2, y + 160, bw, 32), browse, Kind::Accent);
+    return y + h;
 }
 
 void BusyBar(float x, float y, float w) {
@@ -346,10 +251,9 @@ void BusyBar(float x, float y, float w) {
 float DrawReading(float W) {
     auto [x, w] = Content(W);
     g_gfx.Text(Leaf(g_zip), Font::Title, R(x, 28, w, 40), g_gfx.theme.text1);
-    g_gfx.Text(L"Reading the zip…", Font::Body, R(x, 76, w, 20), g_gfx.theme.text2);
-    BusyBar(x, 108, w);
-    Button(kCancel, R(x, 132, 120, 32), L"Cancel", Kind::Standard);
-    return 172;
+    BusyBar(x, 88, w);
+    Button(kCancel, R(x, 112, 120, 32), L"Cancel", Kind::Standard);
+    return 152;
 }
 
 float DrawReady(float W) {
@@ -359,51 +263,38 @@ float DrawReady(float W) {
     float y = 28;
     Button(kBack, R(x, y + 4, 32, 32), L"", Kind::Subtle, true, kGlyphBack);
     g_gfx.Text(Leaf(a.zip), Font::Title, R(x + 44, y, w - 44, 40), t.text1);
-    g_gfx.Text(Compact(a.zip, w - 44), Font::Caption, R(x + 44, y + 40, w - 44, 16), t.text3);
-    y += 72;
+    g_gfx.Text(Fmt(double(a.zipBytes)) + L" zip · " + Fmt(double(a.unpacked)) + L" unpacked · " +
+                   Plural(a.files, L"file", L"files"),
+               Font::Caption, R(x + 44, y + 40, w - 44, 16), t.text2);
+    y += 76;
 
-    bool blocked = a.problemCount > 0;
-    bool fits = !blocked && a.minFree >= int64_t(a.margin);   // the verdict; CanExtract also waits for reads
-    bool normalFits = a.freeBytes >= a.normalNeed + a.margin;
     std::wstring vol = VolumeName();
-    if (blocked) {
-        std::wstring msg = Plural(a.problemCount, L"file", L"files") +
-                           L" can't be handled, so ZeroZip leaves the zip untouched. Use 7-Zip or WinRAR for it.";
+    if (a.problemCount) {
+        std::wstring msg;
         for (size_t i = 0; i < std::min<size_t>(a.problems.size(), 3); i++)
-            msg += L"\n• " + Leaf(a.problems[i].name) + L": " + a.problems[i].reason;
-        y += InfoBar(x, y, w, Bar::Critical, L"This zip can't be extracted in place", msg) + 8;
-    } else if (fits) {
-        y += InfoBar(x, y, w, Bar::Success, normalFits ? L"Fits on " + vol : L"Fits on " + vol + L" when extracted in place",
-                     std::wstring(normalFits ? L"" : L"A regular unzip wouldn't fit. ") + L"Free space goes as low as " +
-                         Fmt(double(a.minFree)) + L" and ends at " + Fmt(double(a.endFree)) + L".") + 8;
+            msg += (i ? L"\n" : L"") + Leaf(a.problems[i].name) + L": " + a.problems[i].reason;
+        y += InfoBar(x, y, w, Bar::Critical, L"This zip can't be extracted", msg) + 8;
+    } else if (a.minFree >= int64_t(a.margin)) {
+        y += InfoBar(x, y, w, Bar::Success, L"Fits on " + vol, L"") + 8;
     } else {
-        std::wstring msg = L"Free up " + Fmt(double(int64_t(a.margin) - a.minFree)) + L" more on " + vol +
-                           L". Even extracting in place, the drive would dip below the 1 GB safety floor.";
-        if (a.sameVolume && !a.sparse)
-            msg += L" This drive can't free space partway through a file, so its biggest file has to fit whole.";
-        y += InfoBar(x, y, w, Bar::Caution, L"Not enough space yet", msg) + 8;
+        y += InfoBar(x, y, w, Bar::Caution, L"Not enough space",
+                     L"Free up " + Fmt(double(int64_t(a.margin) - a.minFree)) + L" more on " + vol + L".") + 8;
     }
     if (!a.lost.empty())
-        y += InfoBar(x, y, w, Bar::Caution, L"A file was lost last time",
-                     Leaf(a.lost) + L" was cut off partway through when the last run stopped, so it's skipped. Get "
-                                    L"that file again from where the zip came from.") + 8;
+        y += InfoBar(x, y, w, Bar::Caution, Leaf(a.lost) + L" was lost last time and will be skipped", L"") + 8;
     else if (a.resuming)
-        y += InfoBar(x, y, w, Bar::Info, L"Resuming a stopped run", L"Files already in the folder are checked and kept.") + 8;
+        y += InfoBar(x, y, w, Bar::Info, L"Continuing where it stopped", L"") + 8;
     if (!a.sameVolume)
         y += InfoBar(x, y, w, Bar::Caution, L"The zip and the folder are on different drives",
-                     L"ZeroZip frees space on the zip's drive, but the folder's drive needs room for every file.") + 8;
+                     L"The folder's drive needs room for every file.") + 8;
     if (a.punchFiles) {
         std::wstring names;
         for (auto& n : a.punchNames) names += (names.empty() ? L"" : L", ") + Leaf(n);
         if (a.punchFiles > a.punchNames.size()) names += L"…";
         y += InfoBar(x, y, w, Bar::Caution, Plural(a.punchFiles, L"file is", L"files are") + L" bigger than the free space",
-                     names + L". Their zip data is freed while they're extracted.") + 8;
+                     names) + 8;
     }
     y += 4;
-
-    Figures(x, y, w, {{Fmt(double(a.zipBytes)), L"Zip on disk"}, {Fmt(double(a.unpacked)), L"Once extracted"},
-                      {Num(a.files), L"Files"}, {Num(a.present), L"Already in the folder"}});
-    y += 80;
 
     std::wstring change = L"Change…";
     float cw = ButtonWidth(change, 96);
@@ -412,35 +303,12 @@ float DrawReady(float W) {
     g_gfx.Text(L"Extract to", Font::Body, R(x + 60, y + 14, w - 100 - cw, 20), t.text1);
     g_gfx.Text(Compact(a.dest, w - 100 - cw), Font::Caption, R(x + 60, y + 36, w - 100 - cw, 16), t.text2);
     Button(kChange, R(x + w - 20 - cw, y + 18, cw, 32), change, Kind::Standard);
-    y += 72;
-
-    float chartH = 300;
-    Card(R(x, y, w, chartH));
-    g_gfx.Text(L"Free space on " + vol + L" during the run", Font::BodyStrong, R(x + 20, y + 16, w - 280, 20), t.text1);
-    float lx = x + w - 20 - 230;
-    g_gfx.Line({lx, y + 26}, {lx + 16, y + 26}, t.accent, 2);
-    g_gfx.Text(L"Free space", Font::Caption, R(lx + 22, y + 18, 90, 16), t.text2);
-    g_gfx.Line({lx + 120, y + 26}, {lx + 136, y + 26}, t.critical, 1, true);
-    g_gfx.Text(L"1 GB floor", Font::Caption, R(lx + 142, y + 18, 90, 16), t.text2);
-    FreeChart(R(x + 16, y + 48, w - 36, 160), true, nullptr);
-    float sy = y + 220;
-    g_gfx.Line({x + 1, sy}, {x + w - 1, sy}, t.divider);
-    std::pair<std::wstring, std::wstring> cells[] = {{Fmt(double(a.freeBytes)), L"Free now"},
-                                                     {Fmt(double(a.minFree)), L"Lowest"},
-                                                     {Fmt(double(a.endFree)), L"When done"},
-                                                     {Fmt(double(a.normalNeed)), L"A regular unzip needs"}};
-    float qw = w / 4;
-    for (int i = 0; i < 4; i++) {
-        g_gfx.Text(cells[i].first, Font::BodyStrong, R(x + 20 + qw * float(i), sy + 18, qw - 28, 20), t.text1);
-        g_gfx.Text(cells[i].second, Font::Caption, R(x + 20 + qw * float(i), sy + 40, qw - 28, 16), t.text2);
-    }
-    return y + chartH;
+    return y + 68;
 }
 
 void ReadyFooter(float W, float H) {
     auto [x, w] = Content(W);
     Footer(W, H);
-    g_gfx.Text(L"The zip is used up as it extracts.", Font::Caption, R(x, H - 64 + 24, w - 280, 16), g_gfx.theme.text2);
     Button(kExtract, R(x + w - 120, H - 48, 120, 32), L"Extract", Kind::Accent, CanExtract());
     Button(kCancel, R(x + w - 248, H - 48, 120, 32), L"Cancel", Kind::Standard);
 }
@@ -451,9 +319,10 @@ float DrawRunning(float W) {
     auto [x, w] = Content(W);
     bool stopping = g_ex.Stopped();
     float y = 28;
-    g_gfx.Text(stopping ? L"Stopping after this file" : g_paused ? L"Paused" : L"Extracting", Font::Title, R(x, y, w, 40), t.text1);
-    g_gfx.Text(Leaf(g_a.zip) + L"  →  " + Compact(g_a.dest, w - 200), Font::Caption, R(x, y + 40, w, 16), t.text3);
-    y += 72;
+    g_gfx.Text(stopping ? L"Stopping after this file" : g_paused ? L"Paused" : L"Extracting", Font::Title, R(x, y, w, 40),
+               t.text1);
+    g_gfx.Text(Leaf(g_a.zip), Font::Caption, R(x, y + 40, w, 16), t.text2);
+    y += 76;
 
     double frac = p.bytesTotal ? double(p.bytesDone) / double(p.bytesTotal) : p.total ? double(p.done) / double(p.total) : 0;
     frac = std::clamp(frac, 0.0, 1.0);
@@ -461,17 +330,13 @@ float DrawRunning(float W) {
     double shown = frac * 100;
     if (shown >= 99.95 && p.done < p.total) shown = 99.9;
     swprintf_s(pct, shown < 10 ? L"%.1f%%" : L"%.0f%%", shown);
-    Card(R(x, y, w, 124));
+    Card(R(x, y, w, 120));
     g_gfx.Text(pct, Font::Large, R(x + 20, y + 12, 240, 52), t.text1);
-    g_gfx.Text(Num(p.done) + L" of " + Num(p.total) + L" entries", Font::Body, R(x + w - 320, y + 34, 300, 20), t.text2, Align::Right);
     float bx = x + 20, bw = w - 40, by = y + 72;
     g_gfx.Line({bx, by + 1.5f}, {bx + bw, by + 1.5f}, t.text3);
     if (frac > 0) g_gfx.Fill(R(bx, by, std::max(3.f, bw * float(frac)), 3), g_paused ? t.caution : t.accent, 1.5f);
-    std::wstring state = g_paused ? L"Paused" : p.verifying ? L"Checking" : p.punching ? L"Freeing as it goes" : L"Extracting";
-    float sw = g_gfx.TextWidth(state, Font::BodyStrong) + 10;
-    g_gfx.Text(state, Font::BodyStrong, R(bx, y + 90, sw, 20), g_paused ? t.caution : t.accent);
-    g_gfx.Text(p.current.empty() ? L"Starting…" : p.current, Font::Body, R(bx + sw, y + 90, bw - sw, 20), t.text2);
-    y += 132;
+    g_gfx.Text(p.current.empty() ? L"Starting…" : Leaf(p.current), Font::Caption, R(bx, y + 88, bw, 16), t.text2);
+    y += 128;
 
     std::wstring speed = L"–", left = L"–";
     if (g_samples.size() > 1) {
@@ -485,43 +350,8 @@ float DrawRunning(float W) {
         }
     }
     if (g_paused) left = L"Paused";
-    Figures(x, y, w, {{speed, L"Speed"}, {left, L"Time left"}, {Clock(g_elapsed), L"Elapsed"}, {Fmt(double(p.zipBytes)), L"Zip left"}});
-    y += 84;
-
-    float lw = std::floor(w * .42f), rw = w - lw - 8, ch = 300;
-    Card(R(x, y, lw, ch));
-    g_gfx.Text(L"Space", Font::BodyStrong, R(x + 20, y + 16, lw - 40, 20), t.text1);
-    g_gfx.Text(L"Free on " + VolumeName(), Font::Body, R(x + 20, y + 48, lw - 140, 20), t.text2);
-    g_gfx.Text(Fmt(double(p.freeBytes)), Font::BodyStrong, R(x + lw - 140, y + 48, 120, 20), t.text1, Align::Right);
-    double cap = std::max({double(g_a.freeBytes), double(g_a.endFree), double(p.freeBytes), 1.0});
-    g_gfx.Fill(R(x + 20, y + 76, lw - 40, 4), t.divider, 2);
-    g_gfx.Fill(R(x + 20, y + 76, std::max(4.f, (lw - 40) * float(std::min(1.0, double(p.freeBytes) / cap))), 4), t.accent, 2);
-    g_gfx.Text(L"Expected low " + Fmt(double(g_a.minFree)) + L", " + Fmt(double(g_a.endFree)) + L" when done", Font::Caption,
-           R(x + 20, y + 88, lw - 40, 16), t.text3);
-    g_gfx.Text(L"Zip given back", Font::Body, R(x + 20, y + 116, lw - 140, 20), t.text2);
-    g_gfx.Text(Fmt(double(g_zipStart - std::min(g_zipStart, p.zipBytes))), Font::BodyStrong, R(x + lw - 140, y + 116, 120, 20),
-           t.text1, Align::Right);
-    FreeChart(R(x + 20, y + 156, lw - 40, ch - 176), false, &g_trace);
-
-    float rx = x + lw + 8;
-    Card(R(rx, y, rw, ch));
-    g_gfx.Text(L"Recently finished", Font::BodyStrong, R(rx + 20, y + 16, rw - 40, 20), t.text1);
-    if (g_recent.empty())
-        g_gfx.Text(L"Files show up here as they're done, last file in the zip first.", Font::Caption,
-               R(rx + 20, y + 48, rw - 40, 16), t.text3);
-    float iy = y + 44;
-    for (auto& it : g_recent) {
-        const wchar_t* glyph = it.result == FileResult::Verified ? kGlyphCheck : it.result == FileResult::Lost ? kGlyphLost : kGlyphFile;
-        D2D1_COLOR_F gc = it.result == FileResult::Lost ? t.critical : it.result == FileResult::Verified ? t.success : t.text2;
-        const wchar_t* label = it.result == FileResult::Verified ? L"Checked" : it.result == FileResult::Lost ? L"Lost" : L"Extracted";
-        g_gfx.Line({rx + 16, iy}, {rx + rw - 16, iy}, t.divider);
-        g_gfx.Text(glyph, Font::Icon16, R(rx + 20, iy + 12, 18, 18), gc);
-        g_gfx.Text(Leaf(it.name), Font::Body, R(rx + 48, iy + 9, rw - 220, 20), t.text1);
-        g_gfx.Text(label, Font::Caption, R(rx + rw - 172, iy + 11, 80, 16), t.text3);
-        g_gfx.Text(Fmt(double(it.size)), Font::Caption, R(rx + rw - 92, iy + 11, 72, 16), t.text2, Align::Right);
-        iy += 42;
-    }
-    return y + ch;
+    Figures(x, y, w, {{speed, L"Speed"}, {left, L"Time left"}, {Fmt(double(p.freeBytes)), L"Free on " + VolumeName()}});
+    return y + 76;
 }
 
 void RunningFooter(float W, float H) {
@@ -535,29 +365,24 @@ void RunningFooter(float W, float H) {
 
 float DrawEnd(float W, float H) {
     const Theme& t = g_gfx.theme;
-    const Progress& p = g_prog;
-    float w = std::min(560.f, W - 80), x = std::floor((W - w) / 2);
+    float w = std::min(520.f, W - 64), x = std::floor((W - w) / 2);
     D2D1_COLOR_F fg = t.success, bg = t.successBg;
     const wchar_t* glyph = kGlyphCheck;
-    std::wstring title, text = g_endText;
-    std::vector<std::pair<std::wstring, std::wstring>> cells;
+    std::wstring title;
     std::vector<std::pair<int, std::wstring>> buttons;
     switch (g_end) {
         case EndKind::Done:
-            title = L"Extraction complete";
-            cells = {{Fmt(double(g_a.unpacked)), L"Extracted"}, {Words(g_elapsed), L"Time"}, {Fmt(double(p.freeBytes)), L"Free on " + VolumeName()}};
+            title = L"Done";
             buttons = {{kOpen, L"Open folder"}, {kAnother, L"Extract another"}};
             break;
         case EndKind::Stopped:
             fg = t.caution; bg = t.cautionBg; glyph = kGlyphPause;
             title = L"Stopped";
-            cells = {{Fmt(double(p.bytesDone)), L"Done"}, {Fmt(double(p.zipBytes)), L"Zip left"}, {Fmt(double(p.freeBytes)), L"Free on " + VolumeName()}};
             buttons = {{kResume, L"Resume"}, {kAnother, L"Close"}};
             break;
         case EndKind::Problem:
             fg = t.critical; bg = t.criticalBg; glyph = kGlyphWarning;
-            title = L"Stopped on a problem";
-            if (p.total) cells = {{Num(p.done) + L" / " + Num(p.total), L"Entries done"}, {Fmt(double(p.zipBytes)), L"Zip left"}, {Fmt(double(p.freeBytes)), L"Free on " + VolumeName()}};
+            title = L"Stopped";
             buttons = {{kResume, L"Resume"}, {kAnother, L"Close"}};
             break;
         case EndKind::CantOpen:
@@ -566,18 +391,14 @@ float DrawEnd(float W, float H) {
             buttons = {{kRetry, L"Try again"}, {kAnother, L"Choose another zip"}};
             break;
     }
-    float height = 96 + 48 + g_gfx.TextHeight(text, Font::Body, w) + 28 + (cells.empty() ? 0 : 104) + 32;
-    float y = std::max(40.f, std::floor((H - height) / 2 - 24));
+    float height = 96 + 48 + g_gfx.TextHeight(g_endText, Font::Body, w) + 28 + 32;
+    float y = std::max(32.f, std::floor((H - height) / 2 - 12));
     g_gfx.Circle({x + w / 2, y + 36}, 36, bg);
     g_gfx.Text(glyph, Font::Icon40, R(x, y + 16, w, 44), fg, Align::Center);
     y += 96;
     g_gfx.Text(title, Font::Title, R(x, y, w, 40), t.text1, Align::Center);
     y += 48;
-    y += g_gfx.Text(text, Font::Body, R(x, y, w, 200), t.text2, Align::Center, true) + 28;
-    if (!cells.empty()) {
-        Figures(x, y, w, cells);
-        y += 76 + 28;
-    }
+    y += g_gfx.Text(g_endText, Font::Body, R(x, y, w, 200), t.text2, Align::Center, true) + 28;
     float total = 0;
     for (auto& b : buttons) total += ButtonWidth(b.second) + 8;
     float bx = x + (w - total + 8) / 2;
@@ -593,33 +414,25 @@ void DrawModal(float W, float H) {
     const Theme& t = g_gfx.theme;
     g_hits.clear();   // only the dialog takes input
     g_gfx.Fill(D2D1::RectF(0, 0, W, H), t.smoke);
-    float w = std::min(480.f, W - 48), x = std::floor((W - w) / 2), tw = w - 48 - 28;
-    std::wstring title, yes, no;
-    std::vector<std::pair<const wchar_t*, std::wstring>> lines;
+    float w = std::min(440.f, W - 48), x = std::floor((W - w) / 2), tw = w - 48;
+    std::wstring title, text, yes, no;
     if (g_modal == Modal::Start) {
-        title = L"Extract and use up the zip?";
-        lines.push_back({kGlyphCut, L"Files come out from the end of the zip. Each file's part of the zip is cut off only "
-                                    L"after the file is written, CRC-checked and saved."});
+        title = L"Extract and delete the zip?";
+        text = L"The zip is used up as it extracts and is gone when it's done.";
         if (g_a.punchFiles)
-            lines.push_back({kGlyphWarning, Plural(g_a.punchFiles, L"file is", L"files are") +
-                                                L" too big for the free space, so their zip data is freed while they're "
-                                                L"extracted. Keep the PC on during those: a power cut there loses that file."});
-        lines.push_back({kGlyphResume, L"You can stop at any time. Open the zip again and ZeroZip picks up where it stopped."});
-        lines.push_back({kGlyphDelete, L"When it finishes, " + Leaf(g_a.zip) + L" is gone. Keep a copy elsewhere if you'll "
-                                       L"need the zip again."});
+            text += L" If the PC loses power while one of the " + Plural(g_a.punchFiles, L"big file", L"big files") +
+                    L" is being extracted, that file is lost.";
         yes = L"Extract";
         no = L"Cancel";
     } else {
         title = L"Stop extracting?";
-        lines.push_back({kGlyphShield, L"Everything finished so far is kept, and the zip keeps the rest. Open the zip again to resume."});
-        if (g_prog.punching)
-            lines.push_back({kGlyphWarning, L"The file being extracted now can't be stopped halfway, so ZeroZip finishes it first."});
+        text = L"You can pick up where it stopped by opening the zip again.";
+        if (g_prog.punching) text += L" The file being extracted now is finished first.";
         yes = L"Stop";
         no = L"Keep going";
     }
-    float bodyH = 24 + 28 + 16;
-    for (auto& l : lines) bodyH += g_gfx.TextHeight(l.second, Font::Body, tw) + 12;
-    float h = bodyH + 12 + 80, y = std::floor((H - h) / 2);
+    float textH = g_gfx.TextHeight(text, Font::Body, tw);
+    float h = 24 + 28 + 12 + textH + 24 + 80, y = std::floor((H - h) / 2);
     D2D1_RECT_F box = R(x, y, w, h);
     g_gfx.Fill(D2D1::RectF(x - 1, y + 2, x + w + 1, y + h + 6), D2D1::ColorF(0, 0, 0, .25f), 9);
     g_gfx.Fill(box, t.dialog, 8);
@@ -628,12 +441,8 @@ void DrawModal(float W, float H) {
     g_gfx.PopClip();
     g_gfx.Line({x, y + h - 80 + .5f}, {x + w, y + h - 80 + .5f}, t.divider);
     g_gfx.Stroke(box, t.cardStroke, 8);
-    g_gfx.Text(title, Font::Subtitle, R(x + 24, y + 24, w - 48, 28), t.text1);
-    float ly = y + 24 + 28 + 16;
-    for (auto& l : lines) {
-        g_gfx.Text(l.first, Font::Icon16, R(x + 24, ly + 2, 18, 18), l.first == kGlyphWarning ? t.caution : t.accent);
-        ly += g_gfx.Text(l.second, Font::Body, R(x + 24 + 28, ly, tw, 200), t.text1, Align::Left, true) + 12;
-    }
+    g_gfx.Text(title, Font::Subtitle, R(x + 24, y + 24, tw, 28), t.text1);
+    g_gfx.Text(text, Font::Body, R(x + 24, y + 64, tw, textH + 4), t.text1, Align::Left, true);
     float bw = (w - 48 - 8) / 2;
     Button(kYes, R(x + 24, y + h - 56, bw, 32), yes, Kind::Accent);
     Button(kNo, R(x + 24 + bw + 8, y + h - 56, bw, 32), no, Kind::Standard);
@@ -653,7 +462,7 @@ void Paint() {
     g_gfx.Translate(-g_scroll);
     float bottom = 0;
     switch (g_screen) {
-        case Screen::Home: bottom = DrawHome(W); break;
+        case Screen::Home: bottom = DrawHome(W, H); break;
         case Screen::Reading: bottom = DrawReading(W); break;
         case Screen::Ready: bottom = DrawReady(W); break;
         case Screen::Running: bottom = DrawRunning(W); break;
@@ -790,24 +599,10 @@ void Pull() {
     {
         std::lock_guard<std::mutex> l(g_mu);
         g_prog = g_shared;
-        while (!g_pending.empty()) {
-            g_recent.push_front(std::move(g_pending.front()));
-            g_pending.pop_front();
-        }
     }
-    while (g_recent.size() > 6) g_recent.pop_back();
     ULONGLONG now = GetTickCount64();
-    g_elapsed = now - g_started;
     if (!g_paused) g_samples.push_back({now, g_prog.bytesDone});
     while (g_samples.size() > 2 && now - g_samples.front().first > 5000) g_samples.pop_front();
-    if (g_zipStart) {
-        double x = double(g_zipStart - std::min(g_zipStart, g_prog.zipBytes)) / double(g_zipStart);
-        double free = double(g_prog.freeBytes);
-        if (g_trace.empty() || x > g_trace.back().first + .002 || std::fabs(free - g_trace.back().second) > 268435456.0)
-            g_trace.push_back({x, free});
-        else
-            g_trace.back().second = free;
-    }
     if (g_prog.bytesTotal) {
         SetTaskbar(g_paused ? TBPF_PAUSED : TBPF_NORMAL, g_prog.bytesDone, g_prog.bytesTotal);
         int pct = int(double(g_prog.bytesDone) * 100 / double(g_prog.bytesTotal));
@@ -822,17 +617,12 @@ void StartRun() {
     if (g_running || g_reading > 0) return;
     g_running = true;
     g_paused = false;
-    g_started = GetTickCount64();
-    g_zipStart = g_a.zipBytes;
     g_prog = Progress();
-    g_recent.clear();
     g_samples.clear();
-    g_trace.assign(1, {0.0, double(g_a.freeBytes)});
     g_titlePct = -1;
     {
         std::lock_guard<std::mutex> l(g_mu);
         g_shared = Progress();
-        g_pending.clear();
     }
     g_ex.Reset();
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);   // don't let the PC sleep mid-run
@@ -849,11 +639,7 @@ void StartRun() {
                     std::lock_guard<std::mutex> l(g_mu);
                     g_shared = p;
                 },
-                [](const std::wstring& name, uint64_t size, FileResult result) {
-                    std::lock_guard<std::mutex> l(g_mu);
-                    g_pending.push_back({name, size, result});
-                    if (g_pending.size() > 64) g_pending.pop_front();
-                },
+                [](const std::wstring&, uint64_t, FileResult) {},
                 r->err);
         } catch (const std::bad_alloc&) {
             r->err = L"ZeroZip ran out of memory. Everything done so far is kept; open the zip again to resume.";
@@ -876,13 +662,12 @@ void OnDone(RunResult* r) {
     g_modal = Modal::None;
     SetTaskbar(r->ok || r->stopped ? TBPF_NOPROGRESS : TBPF_ERROR, 1, 1);
     if (r->ok) {
-        ShowEnd(EndKind::Done, Leaf(g_a.zip) + L" is unpacked and the zip is gone. Every file was CRC-checked as it was written.");
+        ShowEnd(EndKind::Done, L"Extracted to " + g_a.dest);
     } else if (r->stopped) {
-        ShowEnd(EndKind::Stopped, Num(g_prog.done) + L" of " + Num(g_prog.total) +
-                                      L" entries are done. Open the zip again any time and ZeroZip picks up where it stopped.");
+        ShowEnd(EndKind::Stopped, L"Open the zip again any time to continue.");
     } else {
         FlashWindow(g_hwnd, TRUE);
-        ShowEnd(EndKind::Problem, r->err + L"\n\nEverything finished so far is kept.");
+        ShowEnd(EndKind::Problem, r->err);
     }
     delete r;
     if (g_closing) DestroyWindow(g_hwnd);
@@ -1030,8 +815,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             MONITORINFO mi{sizeof mi};
             GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
             auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
-            mm->ptMinTrackSize = {std::min<LONG>(MulDiv(780, int(dpi), 96), mi.rcWork.right - mi.rcWork.left),
-                                  std::min<LONG>(MulDiv(560, int(dpi), 96), mi.rcWork.bottom - mi.rcWork.top)};
+            mm->ptMinTrackSize = {std::min<LONG>(MulDiv(600, int(dpi), 96), mi.rcWork.right - mi.rcWork.left),
+                                  std::min<LONG>(MulDiv(440, int(dpi), 96), mi.rcWork.bottom - mi.rcWork.top)};
             return 0;
         }
         case WM_DPICHANGED: {
@@ -1192,7 +977,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     RegisterClassExW(&wc);
 
     UINT dpi = GetDpiForSystem();
-    int w = MulDiv(1080, int(dpi), 96), h = MulDiv(760, int(dpi), 96);
+    int w = MulDiv(880, int(dpi), 96), h = MulDiv(600, int(dpi), 96);
     RECT work;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     w = std::min<int>(w, work.right - work.left);
