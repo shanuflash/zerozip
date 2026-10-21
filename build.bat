@@ -32,8 +32,7 @@ if "%1"=="test" (
 )
 
 rc /nologo /fo build\zerozip.res src\zerozip.rc || exit /b 1
-cl %CFLAGS% /Ithird_party\webview2\include /Fobuild\ src\main.cpp src\engine.cpp build\zerozip.res build\deps.lib ^
-   third_party\webview2\x64\WebView2LoaderStatic.lib /Fe:ZeroZip.exe ^
-   /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF user32.lib ole32.lib shell32.lib dwmapi.lib advapi32.lib ^
-   version.lib gdi32.lib || exit /b 1
+cl %CFLAGS% /Fobuild\ src\main.cpp src\gfx.cpp src\engine.cpp build\zerozip.res build\deps.lib /Fe:ZeroZip.exe ^
+   /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF user32.lib ole32.lib shell32.lib shlwapi.lib dwmapi.lib advapi32.lib ^
+   d2d1.lib dwrite.lib || exit /b 1
 echo Built ZeroZip.exe

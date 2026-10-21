@@ -2,4 +2,4 @@ build/
 ZeroZip.exe
 *.obj
 *.res
-tests/__pycache__/
+__pycache__/

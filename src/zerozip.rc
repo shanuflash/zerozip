@@ -1,10 +1,7 @@
 #include <winres.h>
 #include "resource.h"
 
-IDI_APP         ICON    "..\\assets\\zerozip.ico"
-IDR_INDEX       RCDATA  "..\\ui\\index.html"
-IDR_FONT_SANS   RCDATA  "..\\ui\\fonts\\Geist-Variable.woff2"
-IDR_FONT_MONO   RCDATA  "..\\ui\\fonts\\GeistMono-Variable.woff2"
+IDI_APP ICON "..\\assets\\zerozip.ico"
 
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "zerozip.manifest"
 
