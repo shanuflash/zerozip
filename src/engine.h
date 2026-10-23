@@ -40,7 +40,9 @@ struct Problem {
 };
 
 struct Analysis {
-    std::wstring zip, dest;
+    std::wstring zip, dest;       // `zip` is the first part of a split zip
+    std::wstring name;            // what to call it: "Game.zip" for Game.zip.001 or Game.z01
+    size_t parts = 1;             // a split zip's parts, including any already used up
     uint64_t zipBytes = 0;        // current size on disk
     uint64_t unpacked = 0;        // total of all files
     uint64_t toWrite = 0;         // bytes that still have to be written
@@ -79,6 +81,7 @@ enum class FileResult { Written, Verified, Lost };
 
 std::wstring SidecarPath(const std::wstring& zip);
 std::wstring LostMarkerPath(const std::wstring& zip);
+std::wstring ArchiveName(const std::wstring& path);
 
 // An empty dest picks one: where a stopped run was going, else next to the zip
 // if it has a single top folder, else a folder named after the zip.

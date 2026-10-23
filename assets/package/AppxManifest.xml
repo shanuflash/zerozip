@@ -2,7 +2,9 @@
 <!-- Registers ZeroZipShell.dll with Explorer for the Windows 11 right-click menu. The package
      only holds this file and its logos; the DLL lives in the folder ZeroZip installs it from.
      It's unsigned, so the publisher carries the OID Windows requires for that, and ZeroZip's
-     code looks it up by this name and publisher. Raise the version along with ZeroZip's. -->
+     code looks it up by this name and publisher. Raise the version along with ZeroZip's.
+     It goes on every file; the DLL shows the entry only for zips and split zips, so which
+     files get it can change without installing the package again. -->
 <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
@@ -12,7 +14,7 @@
   xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
   xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
   IgnorableNamespaces="uap uap10 rescap desktop4 desktop5 desktop6 com">
-  <Identity Name="ZeroZip" Publisher="CN=ZeroZip, OID.2.25.311729368913984317654407730594956997722=1" Version="1.2.0.0" ProcessorArchitecture="x64" />
+  <Identity Name="ZeroZip" Publisher="CN=ZeroZip, OID.2.25.311729368913984317654407730594956997722=1" Version="1.3.0.0" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>ZeroZip</DisplayName>
     <PublisherDisplayName>ZeroZip</PublisherDisplayName>
@@ -46,7 +48,7 @@
         </com:Extension>
         <desktop4:Extension Category="windows.fileExplorerContextMenus">
           <desktop4:FileExplorerContextMenus>
-            <desktop5:ItemType Type=".zip">
+            <desktop5:ItemType Type="*">
               <desktop5:Verb Id="ZeroZipExtract" Clsid="5d1f1c3e-6a51-4f6e-9c1b-2f7a8a0e1d42" />
             </desktop5:ItemType>
           </desktop4:FileExplorerContextMenus>

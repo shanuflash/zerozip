@@ -11,6 +11,7 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <cstring>
 #include <atomic>
 #include <cmath>
 #include <deque>
@@ -57,7 +58,7 @@ Microsoft::WRL::ComPtr<ITaskbarList3> g_taskbar;
 
 Screen g_screen = Screen::Home;
 EndKind g_end = EndKind::Done;
-std::wstring g_endText, g_zip, g_zipDest;   // the zip being read, and the folder asked for
+std::wstring g_endText, g_zip, g_zipName, g_zipDest;   // the zip being read, what to call it, and the folder asked for
 Analysis g_a;
 std::atomic<int> g_reading{0};
 unsigned g_readSeq = 0;                     // only the latest read's result is used
@@ -323,7 +324,7 @@ void BusyBar(float x, float y, float w) {
 
 float DrawReading(float W) {
     float w = W - 2 * kPad;
-    g_gfx.Text(Leaf(g_zip), Font::Subtitle, R(kPad, kPad, w, 28), g_gfx.theme.text1);
+    g_gfx.Text(g_zipName, Font::Subtitle, R(kPad, kPad, w, 28), g_gfx.theme.text1);
     g_gfx.Text(L"Reading the zip\u2026", Font::Body, R(kPad, kPad + 32, w, 20), g_gfx.theme.text2);
     BusyBar(kPad, kPad + 66, w);
     Buttons(W - kPad, kPad + 92, {{kCancel, L"Cancel"}}, Kind::Ghost);
@@ -334,8 +335,10 @@ float DrawReady(float W) {
     const Theme& t = g_gfx.theme;
     const Analysis& a = g_a;
     float x = kPad, w = W - 2 * kPad, y = kPad;
-    g_gfx.Text(Leaf(a.zip), Font::Subtitle, R(x, y, w, 28), t.text1);
-    g_gfx.Text(Fmt(double(a.zipBytes)) + L" \u2192 " + Fmt(double(a.unpacked)) + L"  \u00b7  " + Plural(a.files, L"file", L"files"),
+    g_gfx.Text(a.name, Font::Subtitle, R(x, y, w, 28), t.text1);
+    std::wstring parts = a.parts > 1 ? L"  \u00b7  " + Plural(a.parts, L"part", L"parts") : L"";
+    g_gfx.Text(Fmt(double(a.zipBytes)) + L" \u2192 " + Fmt(double(a.unpacked)) + L"  \u00b7  " + Plural(a.files, L"file", L"files") +
+                   parts,
                Font::Mono, R(x, y + 32, w, 18), t.text2);
     y += 66;
 
@@ -377,7 +380,8 @@ float DrawReady(float W) {
     Button(kChange, in.right - 14 - cw, in.top + (in.bottom - in.top - kButtonH) / 2, change, Kind::Ghost);
     y += 72 + 18;
 
-    g_gfx.Text(L"The zip is deleted as it extracts.", Font::Caption, R(x, y + 10, w - 200, 16), t.text3);
+    g_gfx.Text(a.parts > 1 ? L"Its parts are deleted as it extracts." : L"The zip is deleted as it extracts.", Font::Caption,
+               R(x, y + 10, w - 200, 16), t.text3);
     Buttons(W - kPad, y, {{kCancel, L"Cancel"}, {kExtract, L"Extract"}}, Kind::Primary, CanExtract());
     return y + kButtonH;
 }
@@ -443,7 +447,7 @@ float DrawRunning(float W) {
     const Progress& p = g_prog;
     float x = kPad, w = W - 2 * kPad, y = kPad;
     std::wstring dest = Leaf(g_a.dest);
-    Pieces(x, y, w, {{L"Extracting " + Plural(g_a.files, L"file", L"files") + L" from ", t.text2}, {Leaf(g_a.zip), t.accent},
+    Pieces(x, y, w, {{L"Extracting " + Plural(g_a.files, L"file", L"files") + L" from ", t.text2}, {g_a.name, t.accent},
                      {L" to ", t.text2}, {dest.empty() ? g_a.dest : dest, t.accent}});
     y += 30;
 
@@ -572,7 +576,11 @@ void LoadDrives() {
 // ZeroZipShell.dll; an unsigned package takes admin to install, so turning the menu on asks
 // once, and turning it off doesn't. Windows 10 gets a plain registry entry.
 // Both are for this user only, and go on zips whichever app owns them.
-constexpr wchar_t kMenuKey[] = L"Software\\Classes\\SystemFileAssociations\\.zip\\shell\\ZeroZip";
+const wchar_t* const kMenuTypes[] = {L".zip", L".z01", L".001"};   // zips, and the first part of a split one
+
+std::wstring MenuKey(const wchar_t* type) {
+    return std::wstring(L"Software\\Classes\\SystemFileAssociations\\") + type + L"\\shell\\ZeroZip";
+}
 constexpr wchar_t kPublisher[] = L"CN=ZeroZip, OID.2.25.311729368913984317654407730594956997722=1";   // as in the package manifest
 bool g_modernMenu = false;         // Windows 11's menu
 
@@ -600,11 +608,18 @@ bool SetMenu(bool on) {
             return RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), name, REG_SZ, v.c_str(), DWORD((v.size() + 1) * sizeof(wchar_t))) ==
                    ERROR_SUCCESS;
         };
-        ok = set(kMenuKey, nullptr, L"Extract with ZeroZip") && set(kMenuKey, L"Icon", ExePath() + L",0") &&
-             set(kMenuKey, L"MultiSelectModel", L"Single") && set(std::wstring(kMenuKey) + L"\\command", nullptr, MenuCommand());
+        ok = true;
+        for (const wchar_t* type : kMenuTypes) {
+            std::wstring key = MenuKey(type);
+            ok = ok && set(key, nullptr, L"Extract with ZeroZip") && set(key, L"Icon", ExePath() + L",0") &&
+                 set(key, L"MultiSelectModel", L"Single") && set(key + L"\\command", nullptr, MenuCommand());
+        }
     } else {
-        LSTATUS r = RegDeleteTreeW(HKEY_CURRENT_USER, kMenuKey);
-        ok = r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND;
+        ok = true;
+        for (const wchar_t* type : kMenuTypes) {
+            LSTATUS r = RegDeleteTreeW(HKEY_CURRENT_USER, MenuKey(type).c_str());
+            ok = ok && (r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND);
+        }
     }
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return ok;
@@ -656,6 +671,15 @@ bool WriteResource(int id, const std::wstring& path) {
     const void* data = mem ? LockResource(mem) : nullptr;
     DWORD size = res ? SizeofResource(nullptr, res) : 0;
     if (!data) return false;
+    {
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+        std::vector<uint8_t> have(size);
+        DWORD got = 0;
+        bool same = f != INVALID_HANDLE_VALUE && GetFileSize(f, nullptr) == size && ReadFile(f, have.data(), size, &got, nullptr) &&
+                    got == size && memcmp(have.data(), data, size) == 0;
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        if (same) return true;
+    }
     auto write = [&] {
         HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (f == INVALID_HANDLE_VALUE) return false;
@@ -665,9 +689,9 @@ bool WriteResource(int id, const std::wstring& path) {
         return ok;
     };
     if (write()) return true;
-    // Explorer may have the old DLL loaded. A loaded file can still be renamed out of the way.
-    std::wstring old = path + L".old";
-    DeleteFileW(old.c_str());
+    // Explorer may have the old DLL loaded. A loaded file can still be renamed out of the
+    // way, to a name of its own in case an earlier one is still loaded too.
+    std::wstring old = path + L"." + std::to_wstring(GetTickCount64()) + L".old";
     return MoveFileExW(path.c_str(), old.c_str(), 0) && write();
 }
 
@@ -744,14 +768,31 @@ void OnMenuSwitched(MenuResult r) {
 void LoadMenu() {
     g_modernMenu = Windows11();
     if (g_modernMenu) {
-        g_menu = !MenuPackage().empty();
-        if (g_menu) SavePath();
-        RegDeleteTreeW(HKEY_CURRENT_USER, kMenuKey);   // a Windows 10 style entry would show up twice
+        std::wstring package = MenuPackage();
+        g_menu = !package.empty();
+        if (g_menu) {
+            SavePath();
+            // A newer DLL replaces the old one without asking. A newer package needs the
+            // admin prompt again, so that's left to the user.
+            std::wstring dir = MenuFolder();
+            if (!dir.empty()) {
+                WriteResource(IDR_SHELL_DLL, dir + L"\\ZeroZipShell.dll");
+                WIN32_FIND_DATAW f;   // old DLLs moved aside, once Explorer has let go of them
+                HANDLE find = FindFirstFileW((dir + L"\\ZeroZipShell.dll.*.old").c_str(), &f);
+                if (find != INVALID_HANDLE_VALUE) {
+                    do DeleteFileW((dir + L"\\" + f.cFileName).c_str());
+                    while (FindNextFileW(find, &f));
+                    FindClose(find);
+                }
+            }
+            if (package.rfind(L"ZeroZip_" ZEROZIP_PACKAGE_VERSION L"_", 0) != 0) g_menuNote = L"Turn it off and on to update it";
+        }
+        for (const wchar_t* type : kMenuTypes) RegDeleteTreeW(HKEY_CURRENT_USER, MenuKey(type).c_str());   // would show up twice
         return;
     }
     wchar_t v[2048];
     DWORD size = sizeof v;
-    g_menu = RegGetValueW(HKEY_CURRENT_USER, (std::wstring(kMenuKey) + L"\\command").c_str(), nullptr, RRF_RT_REG_SZ, nullptr, v,
+    g_menu = RegGetValueW(HKEY_CURRENT_USER, (MenuKey(kMenuTypes[0]) + L"\\command").c_str(), nullptr, RRF_RT_REG_SZ, nullptr, v,
                           &size) == ERROR_SUCCESS;
     if (g_menu && MenuCommand() != v) SetMenu(true);
 }
@@ -771,7 +812,7 @@ void Go(Screen s) {
 
 // "42% Game.zip" while extracting, like a download manager; just the name otherwise.
 void SetTitle(const std::wstring& prefix) {
-    std::wstring t = prefix.empty() ? L"ZeroZip" : prefix + L" " + Leaf(g_a.zip);
+    std::wstring t = prefix.empty() ? L"ZeroZip" : prefix + L" " + g_a.name;
     SetWindowTextW(g_hwnd, t.c_str());
 }
 
@@ -785,6 +826,7 @@ void ShowEnd(EndKind kind, std::wstring text) {
 void Read(std::wstring zip, std::wstring dest) {
     if (g_running) return;
     g_zip = zip;
+    g_zipName = ArchiveName(zip);
     g_zipDest = dest;
     unsigned seq = ++g_readSeq;
     SetTaskbar(TBPF_NOPROGRESS);
@@ -947,7 +989,7 @@ std::wstring Pick(bool folder, const std::wstring& start) {
         Microsoft::WRL::ComPtr<IShellItem> at;
         if (!dir.empty() && SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, IID_PPV_ARGS(&at)))) d->SetFolder(at.Get());
     } else {
-        COMDLG_FILTERSPEC spec[] = {{L"Zip archives", L"*.zip"}, {L"All files", L"*.*"}};
+        COMDLG_FILTERSPEC spec[] = {{L"Zip archives", L"*.zip;*.z01;*.001"}, {L"All files", L"*.*"}};
         d->SetFileTypes(2, spec);
         d->SetTitle(L"Choose a zip to extract");
     }

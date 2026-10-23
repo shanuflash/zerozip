@@ -48,6 +48,51 @@ def write_zip(path, entries):
         f.write(struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(entries), len(entries), len(cd), cdo, 0))
 
 
+def split_file(path, part):
+    """Cuts a zip into Game.zip.001, .002, ... as 7-Zip's split does, and removes it."""
+    data = open(path, "rb").read()
+    os.remove(path)
+    names = []
+    for i in range(0, len(data), part):
+        names.append("%s.%03d" % (path, len(names) + 1))
+        open(names[-1], "wb").write(data[i:i + part])
+    return names
+
+
+def write_spanned(stem, entries, part):
+    """A spanned zip as WinZip and WinRAR write one: stem.z01, .z02, ..., stem.zip, each
+    offset counted from the start of the part ("disk") it falls in."""
+    tm, dt = dos_time()
+    body = bytearray(struct.pack("<I", 0x08074B50))   # spanning signature at the start of the first part
+    recs = []
+    for name, data, method, flags in entries:
+        raw = name.encode("utf-8")
+        data = data or b""
+        if method == 8:
+            c = zlib.compressobj(6, zlib.DEFLATED, -15)
+            comp = c.compress(data) + c.flush()
+        elif method == 93:
+            comp = zstandard.ZstdCompressor(level=3).compress(data)
+        else:
+            comp = data
+        crc = zlib.crc32(data)
+        recs.append((raw, flags | 0x800, method, crc, len(comp), len(data), 0x10 if name.endswith("/") else 0x20, len(body)))
+        body += struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, flags | 0x800, method, tm, dt, crc, len(comp), len(data), len(raw), 0)
+        body += raw + comp
+    cd = b""
+    for raw, flags, method, crc, cs, us, attrs, off in recs:
+        cd += struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, flags, method, tm, dt, crc, cs, us, len(raw), 0, 0,
+                          off // part, 0, attrs, off % part) + raw
+    cdo = len(body)
+    body += cd
+    disks = (len(body) + 22 + part - 1) // part
+    body += struct.pack("<IHHHHIIH", 0x06054B50, disks - 1, cdo // part, len(recs), len(recs), len(cd), cdo % part, 0)
+    names = ["%s.z%02d" % (stem, i + 1) for i in range(disks - 1)] + [stem + ".zip"]
+    for i, n in enumerate(names):
+        open(n, "wb").write(body[i * part:(i + 1) * part])
+    return names
+
+
 def blob(n, seed):
     r = random.Random(seed)
     words = [bytes(r.randrange(97, 123) for _ in range(r.randrange(3, 9))) for _ in range(200)]
@@ -366,6 +411,109 @@ def main():
     expect_tree(d, expected)
     assert not os.path.exists(os.path.join(d, "Game", "data", "bad.bin")) and not os.path.exists(z + ".zerozip-lost")
     ok("damaged hole-punched file is reported lost and skipped on resume")
+
+    # split zips: Game.zip.001, .002, ... and Game.z01, .z02, ..., Game.zip
+    part = 3 << 20
+    kinds = (
+        ("split", lambda stem: split_file(fresh(stem + ".zip", entries), part)),
+        ("spanned", lambda stem: write_spanned(os.path.join(work, stem), entries, part)),
+    )
+    for kind, make in kinds:
+        parts = make(kind + "-full")
+        assert len(parts) > 4, parts
+        d = os.path.join(work, kind + "-out1")
+        code, out = run("plan", parts[2], d)   # any part opens the whole set
+        assert code == 0 and "problems=0" in out, out
+        code, out = run("run", parts[2], d)
+        assert code == 0 and out.strip().endswith("done"), out
+        expect_tree(d, expected)
+        assert not any(os.path.exists(p) for p in parts) and not os.path.exists(parts[0] + ".zerozip")
+    ok("split zips (.001 and .z01) extract in full, opened from any part")
+
+    for kind, make in kinds:
+        parts = make(kind + "-resume")
+        d = os.path.join(work, kind + "-out2")
+        code, out = run("run", parts[-1], d, "--stop-after", "3")
+        assert code == 3 and "stopped" in out, out
+        left = [p for p in parts if os.path.exists(p)]
+        assert left and len(left) < len(parts) and left == parts[:len(left)], (kind, left)
+        assert os.path.exists(parts[0] + ".zerozip")
+        code, out = run("plan", parts[0])   # the last part, holding the index, is already gone
+        assert "resuming=1" in out and "problems=0" in out and "dest=%s\n" % d in out, out
+        code, out = run("run", parts[0], d)
+        assert code == 0 and "done" in out, out
+        expect_tree(d, expected)
+        assert not any(os.path.exists(p) for p in parts)
+    ok("split zips delete used-up parts from the end, and resume")
+
+    for kind, make in kinds:
+        parts = make(kind + "-gap")
+        os.rename(parts[1], parts[1] + ".away")
+        sizes = [os.path.getsize(p) for p in parts if os.path.exists(p)]
+        code, out = run("plan", parts[0], os.path.join(work, kind + "-out3"))
+        assert code == 1 and "missing" in out, out
+        code, out = run("run", parts[0], os.path.join(work, kind + "-out3"))
+        assert code == 1 and "missing" in out, out
+        assert [os.path.getsize(p) for p in parts if os.path.exists(p)] == sizes and not os.path.exists(parts[0] + ".zerozip")
+        if kind == "split":
+            assert os.path.basename(parts[1]) in out, out   # says which one
+    ok("a split zip with a part missing is refused untouched")
+
+    # A crash between shrinking one part and deleting the next leaves that next part behind.
+    parts = split_file(fresh("leftover.zip", entries), part)
+    keep = {p: open(p, "rb").read() for p in parts}
+    d = os.path.join(work, "split-out4")
+    code, out = run("run", parts[0], d, "--stop-after", "3")
+    assert code == 3, out
+    deleted = [p for p in parts if not os.path.exists(p)]
+    assert deleted, out
+    open(deleted[0], "wb").write(keep[deleted[0]])
+    code, out = run("run", parts[0], d)
+    assert code == 0 and "done" in out, out
+    expect_tree(d, expected)
+    assert not any(os.path.exists(p) for p in parts)
+    ok("a part left behind by a crash is cleaned up on resume")
+
+    # A cut right at the start of a part, under a file that runs across several parts:
+    # stopped while deleting the parts after it, in either order, it still resumes.
+    z = fresh("edge.zip", entries)
+    with zipfile.ZipFile(z) as zf:
+        at = zf.getinfo("Game/data/random-stored.bin").header_offset
+    data = open(z, "rb").read()
+    os.remove(z)
+    cuts = [0, at, at + (3 << 20), at + (6 << 20), at + (9 << 20) + 4096, len(data)]
+    parts = ["%s.%03d" % (z, i + 1) for i in range(len(cuts) - 1)]
+    for i, n in enumerate(parts):
+        open(n, "wb").write(data[cuts[i]:cuts[i + 1]])
+    keep = {n: open(n, "rb").read() for n in parts}
+    d = os.path.join(work, "split-out6")
+    code, out = run("run", parts[0], d, "--stop-after", "3")   # the last three files, the stored one last
+    assert code == 3 and "wrote Game/data/random-stored.bin" in out, out
+    assert os.path.getsize(parts[1]) == 0 and not any(os.path.exists(n) for n in parts[2:]), out
+    # as if deleting stopped partway: the emptied part and some after it are still there
+    for n in parts[2:4]:
+        open(n, "wb").write(keep[n])
+    code, out = run("plan", parts[0])
+    assert "resuming=1" in out and "problems=0" in out, out
+    # and with the part at the cut still full and the ones after it gone, so the archive ends mid-file
+    open(parts[1], "wb").write(keep[parts[1]])
+    for n in parts[2:4]:
+        os.remove(n)
+    code, out = run("run", parts[0], d)
+    assert code == 0 and "done" in out, out
+    expect_tree(d, expected)
+    assert not any(os.path.exists(n) for n in parts)
+    ok("a cut at a part boundary survives being stopped while deleting parts")
+
+    # A file spread over several parts frees its data in each of them as it goes.
+    for kind, make in kinds:
+        parts = make(kind + "-punch")
+        d = os.path.join(work, kind + "-out5")
+        code, out = run("run", parts[0], d, env=punch_env(8 << 20))
+        assert code == 0 and "done" in out, out
+        expect_tree(d, expected)
+        assert not any(os.path.exists(p) for p in parts)
+    ok("hole-punch mode works across the parts of a split zip")
 
     shutil.rmtree(work, ignore_errors=True)
     print("\n%d groups passed" % passed)

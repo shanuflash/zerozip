@@ -22,7 +22,7 @@ namespace {
 constexpr uint64_t kMargin = 1ull << 30;   // never let the drive go below this
 constexpr uint64_t kWindow = 64ull << 20;  // hole-punch mode frees zip data in steps this big
 constexpr size_t kChunk = 4u << 20;
-constexpr char kSidecarMagic[8] = {'Z', 'E', 'R', 'O', 'Z', 'I', 'P', '2'};
+constexpr char kSidecarMagic[8] = {'Z', 'E', 'R', 'O', 'Z', 'I', 'P', '3'};
 constexpr wchar_t kTemp[] = L".zzpart";
 constexpr size_t kTempLen = 7;
 
@@ -285,11 +285,289 @@ bool DosAttrs(const ZipEntry& e) {
     return host == 0 || host == 10 || host == 11 || host == 14;
 }
 
+std::wstring Leaf(const std::wstring& p) { return p.substr(p.find_last_of(L'\\') + 1); }
+
+// ---- the archive on disk ------------------------------------------------------
+//
+// A zip can come in parts. A plain split (Game.zip.001, .002, ...) is one zip cut
+// into pieces. A spanned zip (Game.z01, .z02, ..., Game.zip) calls its parts disks
+// and counts offsets from the start of each. Either way the parts are read as one
+// long archive, and cutting it shrinks the part the cut falls in and deletes the
+// parts after it. The first part goes last, so it's where the resume data lives.
+
+enum class SetKind : uint32_t { Single, Split, Spanned };
+
+// The file name of part `i` (from 0) of a set whose first part is `first`.
+std::wstring PartPath(const std::wstring& first, SetKind kind, size_t i, size_t count) {
+    std::wstring stem = first.substr(0, first.find_last_of(L'.'));
+    if (kind == SetKind::Split) {
+        size_t width = first.size() - stem.size() - 1;
+        std::wstring n = std::to_wstring(i + 1);
+        return stem + L"." + std::wstring(n.size() < width ? width - n.size() : 0, L'0') + n;
+    }
+    if (kind == SetKind::Spanned) {
+        if (i + 1 == count) return stem + L".zip";
+        return stem + (i < 9 ? L".z0" : L".z") + std::to_wstring(i + 1);
+    }
+    return first;
+}
+
+bool Exists(const std::wstring& p) {
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// Which kind of set `path` looks like it belongs to, and that set's first part, from
+// the names alone. A part that isn't next to its first part is read on its own.
+SetKind KindOf(const std::wstring& path, std::wstring& first) {
+    first = path;
+    std::wstring leaf = Lower(Leaf(path));
+    size_t dot = leaf.find_last_of(L'.');
+    if (dot == std::wstring::npos) return SetKind::Single;
+    std::wstring ext = leaf.substr(dot + 1), stem = path.substr(0, path.size() - ext.size() - 1);
+    bool digits = !ext.empty() && std::all_of(ext.begin(), ext.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+    if (digits && ext.size() >= 3) {
+        std::wstring one = stem + L"." + std::wstring(ext.size() - 1, L'0') + L"1";
+        if (Exists(one)) { first = one; return SetKind::Split; }
+    } else if (ext.size() >= 3 && ext[0] == L'z' && std::all_of(ext.begin() + 1, ext.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; })) {
+        if (Exists(stem + L".z01")) { first = stem + L".z01"; return SetKind::Spanned; }
+    } else if (ext == L"zip" && Exists(stem + L".z01")) {
+        first = stem + L".z01";
+        return SetKind::Spanned;
+    }
+    return SetKind::Single;
+}
+
+struct Part {
+    std::wstring path;
+    uint64_t start = 0, size = 0;   // where it sits in the joined archive, and its full size
+};
+
+class Archive {
+public:
+    SetKind kind = SetKind::Single;
+    std::vector<Part> parts;        // every part the set started with
+    std::vector<HANDLE> open;       // handles for the parts still there, from the first
+    uint64_t size = 0;              // what's left of the joined archive
+
+    Archive() = default;
+    Archive(const Archive&) = delete;
+    Archive& operator=(const Archive&) = delete;
+    ~Archive() { Close(); }
+
+    void Close() {
+        for (HANDLE h : open) CloseHandle(h);
+        open.clear();
+    }
+
+    const std::wstring& First() const { return parts[0].path; }
+    HANDLE FirstHandle() const { return open[0]; }
+
+    // Where each disk starts, for a spanned zip's offsets. A plain split is one disk.
+    std::vector<uint64_t> Disks() const {
+        std::vector<uint64_t> d;
+        if (kind == SetKind::Spanned)
+            for (auto& p : parts) d.push_back(p.start);
+        else
+            d.push_back(0);
+        return d;
+    }
+
+    // Opens the parts at their full `sizes`. Parts already used up are gone, and the
+    // archive ends where the first part shorter than its full size ends.
+    bool Open(SetKind k, const std::wstring& first, const std::vector<uint64_t>& sizes, bool write, std::wstring& err) {
+        Close();
+        kind = k;
+        parts.clear();
+        uint64_t at = 0;
+        for (size_t i = 0; i < sizes.size(); i++) {
+            parts.push_back({PartPath(first, k, i, sizes.size()), at, sizes[i]});
+            at += sizes[i];
+        }
+        size = 0;
+        for (size_t i = 0; i < parts.size(); i++) {
+            HANDLE h = CreateFileW(parts[i].path.c_str(), write ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ,
+                                   write ? 0 : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0,
+                                   nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                DWORD code = GetLastError();
+                if (i > 0 && code == ERROR_FILE_NOT_FOUND) break;   // used up and deleted
+                std::wstring what = parts.size() > 1 ? L"\"" + Leaf(parts[i].path) + L"\"" : L"the zip";
+                err = code == ERROR_SHARING_VIOLATION
+                          ? L"Another app has " + what + L" open. Close WinRAR, 7-Zip or anything else using it, then try again."
+                          : L"Couldn't open " + what + L": " + ErrText(code);
+                return false;
+            }
+            open.push_back(h);
+            uint64_t now = FileSize(h);
+            if (now > parts[i].size) {
+                err = L"\"" + Leaf(parts[i].path) + L"\" has changed since ZeroZip last worked on it, so it can't be resumed safely.";
+                return false;
+            }
+            size = parts[i].start + now;
+            if (now < parts[i].size) break;   // the last cut fell here; later parts are leftovers
+        }
+        return true;
+    }
+
+    // The part `off` falls in.
+    size_t PartAt(uint64_t off) const {
+        size_t i = 0;
+        while (i + 1 < open.size() && parts[i + 1].start <= off) i++;
+        return i;
+    }
+
+    bool Read(uint64_t off, void* buf, size_t n) {
+        if (off + n > size) return false;
+        auto* p = static_cast<uint8_t*>(buf);
+        while (n) {
+            size_t i = PartAt(off);
+            uint64_t local = off - parts[i].start;
+            size_t take = size_t(std::min<uint64_t>(n, parts[i].size - local));
+            if (!take || !ReadAt(open[i], local, p, take)) return false;
+            p += take;
+            off += take;
+            n -= take;
+        }
+        return true;
+    }
+
+    // Lets the parts holding [from, to) have ranges freed inside them.
+    bool MakeSparse(uint64_t from, uint64_t to) {
+        for (size_t i = PartAt(from); i < open.size() && parts[i].start < to; i++) {
+            DWORD ret = 0;
+            FILE_SET_SPARSE_BUFFER sb{TRUE};
+            if (!DeviceIoControl(open[i], FSCTL_SET_SPARSE, &sb, sizeof sb, nullptr, 0, &ret, nullptr)) return false;
+        }
+        return true;
+    }
+
+    // Frees the data in [from, to), which may cross parts.
+    bool Punch(uint64_t from, uint64_t to) {
+        for (size_t i = PartAt(from); i < open.size() && parts[i].start < to; i++) {
+            uint64_t a = std::max(from, parts[i].start) - parts[i].start;
+            uint64_t b = std::min(to, parts[i].start + parts[i].size) - parts[i].start;
+            if (a >= b) continue;
+            FILE_ZERO_DATA_INFORMATION z{};
+            z.FileOffset.QuadPart = LONGLONG(a);
+            z.BeyondFinalZero.QuadPart = LONGLONG(b);
+            DWORD ret = 0;
+            if (!DeviceIoControl(open[i], FSCTL_SET_ZERO_DATA, &z, sizeof z, nullptr, 0, &ret, nullptr)) return false;
+        }
+        return true;
+    }
+
+    // Cuts the archive off at `at`: the part it falls in is shrunk, and every part
+    // after it deleted, last first. The first part is only ever shrunk. A cut right
+    // at the start of a part empties that part first, so if the deleting is cut
+    // short, Open still finds the archive ending at `at`.
+    bool Cut(uint64_t at, std::wstring& err) {
+        if (at >= size) return true;
+        size_t i = 0;
+        while (i + 1 < open.size() && parts[i + 1].start <= at) i++;
+        if (!Shrink(open[i], at - parts[i].start)) {
+            err = L"Couldn't shrink the zip: " + ErrText(GetLastError());
+            return false;
+        }
+        for (size_t j = parts.size(); j-- > i + 1;) {
+            if (j < open.size()) {
+                CloseHandle(open[j]);
+                open.pop_back();
+            }
+            if (!RemoveFile(parts[j].path)) {
+                err = L"Couldn't delete \"" + Leaf(parts[j].path) + L"\": " + ErrText(GetLastError());
+                return false;
+            }
+        }
+        if (i + 1 < parts.size()) FlushDir(ParentOf(parts[0].path));
+        size = at;
+        return true;
+    }
+
+    // Deletes what's left, once everything has been extracted.
+    bool Remove(std::wstring& err) {
+        Close();
+        for (size_t j = parts.size(); j-- > 0;)
+            if (!RemoveFile(parts[j].path)) {
+                err = L"Everything was extracted, but the empty zip couldn't be deleted: " + ErrText(GetLastError());
+                return false;
+            }
+        return true;
+    }
+
+private:
+    static bool Shrink(HANDLE h, uint64_t at) {
+        if (at >= FileSize(h)) return true;
+        FILE_END_OF_FILE_INFO eof{};
+        eof.EndOfFile.QuadPart = LONGLONG(at);
+        if (!SetFileInformationByHandle(h, FileEndOfFileInfo, &eof, sizeof eof) || !FlushFileBuffers(h)) return false;
+        // Moving the end alone keeps the clusters reserved until the handle closes;
+        // shrinking the allocation too gives them back to the drive right away. Only
+        // ever shrink it: a sparse zip with freed ranges has less allocated than `at`.
+        FILE_STANDARD_INFO info{};
+        if (GetFileInformationByHandleEx(h, FileStandardInfo, &info, sizeof info) && uint64_t(info.AllocationSize.QuadPart) > at) {
+            FILE_ALLOCATION_INFO alloc{};
+            alloc.AllocationSize.QuadPart = LONGLONG(at);
+            SetFileInformationByHandle(h, FileAllocationInfo, &alloc, sizeof alloc);
+        }
+        return true;
+    }
+};
+
+// Finds every part of a set from its first, and their sizes. A gap is reported by name.
+bool FindParts(SetKind kind, const std::wstring& first, std::vector<uint64_t>& sizes, std::wstring& err) {
+    sizes.clear();
+    auto sizeOf = [](const std::wstring& p, uint64_t& s) { return SizeOnDisk(p, s); };
+    if (kind == SetKind::Single) {
+        uint64_t s = 0;
+        if (!sizeOf(first, s)) { err = L"Couldn't open the zip: " + ErrText(GetLastError()); return false; }
+        sizes.push_back(s);
+        return true;
+    }
+    // Spanned parts are numbered up to the last, which is the .zip; split parts until one is missing.
+    for (size_t i = 0;; i++) {
+        std::wstring p = PartPath(first, kind, i, kind == SetKind::Spanned ? SIZE_MAX : 0);
+        uint64_t s = 0;
+        if (!sizeOf(p, s)) break;
+        sizes.push_back(s);
+    }
+    if (kind == SetKind::Spanned) {
+        uint64_t s = 0;
+        std::wstring last = PartPath(first, kind, sizes.size(), sizes.size() + 1);
+        if (!sizeOf(last, s)) { err = L"The last part, \"" + Leaf(last) + L"\", is missing."; return false; }
+        sizes.push_back(s);
+    }
+    // A part found after a gap means the gap is a missing part, not the end.
+    for (size_t k = 1; k <= 3 && kind == SetKind::Split; k++) {
+        std::wstring after = PartPath(first, kind, sizes.size() + k, 0);
+        if (Exists(after)) {
+            err = L"\"" + Leaf(PartPath(first, kind, sizes.size(), 0)) + L"\" is missing.";
+            return false;
+        }
+    }
+    return true;
+}
+
 // ---- reading the zip's index ------------------------------------------------
 
 const wchar_t kDamaged[] = L"The zip's file list is damaged or this is not a zip file.";
 
-bool ParseTail(const uint8_t* buf, size_t len, uint64_t base, ZipIndex& idx, std::wstring& err) {
+// Where `off` on `disk` is in the joined archive. In a zip that is one disk, disk
+// numbers are ignored: some writers leave odd values in them.
+bool OnDisk(const std::vector<uint64_t>& disks, uint64_t disk, uint64_t off, uint64_t& at) {
+    if (disks.size() == 1) disk = 0;
+    if (disk >= disks.size()) return false;
+    at = disks[disk] + off;
+    return true;
+}
+
+const wchar_t kPartMissing[] = L"A part of this split zip is missing. Put all of its parts in the same folder.";
+const wchar_t kOnePart[] = L"This is one part of a split zip, and its other parts weren't found next to it.";
+
+// `buf` is the archive from its central directory, at `base`, to its end. `disks`
+// says where each disk of a spanned zip starts; anything else is one disk.
+bool ParseTail(const uint8_t* buf, size_t len, uint64_t base, const std::vector<uint64_t>& disks, ZipIndex& idx,
+               std::wstring& err) {
     if (len < 22) { err = kDamaged; return false; }
     size_t eocd = SIZE_MAX;
     for (size_t i = len - 22 + 1; i-- > 0 && len - i <= 22 + 65535;) {
@@ -299,16 +577,22 @@ bool ParseTail(const uint8_t* buf, size_t len, uint64_t base, ZipIndex& idx, std
     const uint8_t* e = buf + eocd;
     uint64_t disk = rd16(e + 4), cdDisk = rd16(e + 6), count = rd16(e + 10), cdOff = rd32(e + 16);
     if (eocd >= 20 && rd32(e - 20) == 0x07064b50) {
-        uint64_t z64 = rd64(e - 20 + 8);
-        if (rd32(e - 20 + 16) > 1) { err = L"Split (multi-part) zips aren't supported."; return false; }
-        if (z64 < base || z64 - base + 56 > len || rd32(buf + (z64 - base)) != 0x06064b50) { err = kDamaged; return false; }
+        uint64_t z64 = 0;
+        if (rd32(e - 20 + 16) != disks.size() && rd32(e - 20 + 16) > 1) { err = disks.size() == 1 ? kOnePart : kPartMissing; return false; }
+        if (!OnDisk(disks, rd32(e - 20 + 4), rd64(e - 20 + 8), z64) || z64 < base || z64 - base + 56 > len ||
+            rd32(buf + (z64 - base)) != 0x06064b50) {
+            err = kDamaged;
+            return false;
+        }
         const uint8_t* z = buf + (z64 - base);
         disk = rd32(z + 16);
         cdDisk = rd32(z + 20);
         count = rd64(z + 32);
         cdOff = rd64(z + 48);
     }
-    if (disk || cdDisk) { err = L"Split (multi-part) zips aren't supported."; return false; }
+    if (disks.size() == 1 && (disk || cdDisk)) { err = kOnePart; return false; }
+    if (disks.size() > 1 && disk + 1 != disks.size()) { err = kPartMissing; return false; }
+    if (!OnDisk(disks, cdDisk, cdOff, cdOff)) { err = kDamaged; return false; }
     if (cdOff != base) {
         err = L"This zip has extra data around its contents (a self-extractor?) and isn't supported.";
         return false;
@@ -327,7 +611,7 @@ bool ParseTail(const uint8_t* buf, size_t len, uint64_t base, ZipIndex& idx, std
         z.dosTime = rd16(c + 12);
         z.dosDate = rd16(c + 14);
         z.crc = rd32(c + 16);
-        uint64_t cs = rd32(c + 20), us = rd32(c + 24), lho = rd32(c + 42);
+        uint64_t cs = rd32(c + 20), us = rd32(c + 24), lho = rd32(c + 42), start = rd16(c + 34);
         size_t nlen = rd16(c + 28), xlen = rd16(c + 30), clen = rd16(c + 32);
         z.attrs = rd32(c + 38);
         if (p + 46 + nlen + xlen + clen > len) { err = kDamaged; return false; }
@@ -343,6 +627,7 @@ bool ParseTail(const uint8_t* buf, size_t len, uint64_t base, ZipIndex& idx, std
                 if (us == 0xFFFFFFFF && r + 8 <= sz) { us = rd64(d + r); r += 8; }
                 if (cs == 0xFFFFFFFF && r + 8 <= sz) { cs = rd64(d + r); r += 8; }
                 if (lho == 0xFFFFFFFF && r + 8 <= sz) { lho = rd64(d + r); r += 8; }
+                if (start == 0xFFFF && r + 4 <= sz) { start = rd32(d + r); r += 4; }
             } else if (id == 0x7075 && sz >= 5 && !(z.flags & 0x800)) {
                 if (rd32(d + 1) == Crc32(0, name, nlen)) z.name = Decode(d + 5, sz - 5u, true);
             }
@@ -350,7 +635,7 @@ bool ParseTail(const uint8_t* buf, size_t len, uint64_t base, ZipIndex& idx, std
         }
         z.size = us;
         z.csize = cs;
-        z.offset = lho;
+        if (!OnDisk(disks, start, lho, z.offset)) { err = kDamaged; return false; }
         z.isDir = (!z.name.empty() && (z.name.back() == L'/' || z.name.back() == L'\\')) ||
                   (DosAttrs(z) && (z.attrs & FILE_ATTRIBUTE_DIRECTORY) && z.size == 0);
         if (z.offset >= base) { err = kDamaged; return false; }
@@ -364,48 +649,58 @@ bool ParseTail(const uint8_t* buf, size_t len, uint64_t base, ZipIndex& idx, std
     return true;
 }
 
-bool ReadIndexFromZip(HANDLE h, ZipIndex& idx, std::wstring& err) {
-    uint64_t size = FileSize(h);
+bool ReadIndexFromZip(Archive& arc, ZipIndex& idx, std::wstring& err) {
+    uint64_t size = arc.size;
+    std::vector<uint64_t> disks = arc.Disks();
     size_t look = size_t(std::min<uint64_t>(size, 22 + 65535 + 20 + 56));
     std::vector<uint8_t> end(look);
-    if (!ReadAt(h, size - look, end.data(), look)) { err = L"Couldn't read the zip: " + ErrText(GetLastError()); return false; }
+    if (!arc.Read(size - look, end.data(), look)) { err = L"Couldn't read the zip: " + ErrText(GetLastError()); return false; }
     // Find where the central directory starts, then read it through end of file.
     uint64_t cdOff = UINT64_MAX, cdSize = 0;
     for (size_t i = look >= 22 ? look - 22 + 1 : 0; i-- > 0;) {
         const uint8_t* e = end.data() + i;
         if (rd32(e) != 0x06054b50 || i + 22 + rd16(e + 20) > look) continue;
-        cdOff = rd32(e + 16);
+        uint64_t disk = rd16(e + 4), cdDisk = rd16(e + 6), off = rd32(e + 16);
         cdSize = rd32(e + 12);
         if (i >= 20 && rd32(e - 20) == 0x07064b50) {
-            uint64_t z64 = rd64(e - 20 + 8);
+            uint64_t z64 = 0;
             uint8_t rec[56];
-            if (z64 + 56 <= size && ReadAt(h, z64, rec, 56) && rd32(rec) == 0x06064b50) {
-                cdOff = rd64(rec + 48);
+            if (OnDisk(disks, rd32(e - 20 + 4), rd64(e - 20 + 8), z64) && z64 + 56 <= size && arc.Read(z64, rec, 56) &&
+                rd32(rec) == 0x06064b50) {
+                disk = rd32(rec + 16);
+                cdDisk = rd32(rec + 20);
                 cdSize = rd64(rec + 40);
+                off = rd64(rec + 48);
             }
         }
+        // The end record says which disk it's on: the last, if no part is missing.
+        if (disks.size() == 1 && (disk || cdDisk)) { err = kOnePart; return false; }
+        if (disks.size() > 1 && disk + 1 != disks.size()) { err = kPartMissing; return false; }
+        if (!OnDisk(disks, cdDisk, off, cdOff)) cdOff = UINT64_MAX;
         break;
     }
     // After the directory come only the end records and a comment, so anything
     // much bigger means the offsets are garbage.
     if (cdOff == UINT64_MAX || cdOff >= size || cdSize > size - cdOff || size - cdOff - cdSize > (1u << 20)) {
-        err = L"This doesn't look like a zip file, or its end is missing (still downloading?).";
+        err = arc.parts.size() > 1 ? L"This split zip's end is missing. Check that all of its parts are here and fully downloaded."
+                                   : L"This doesn't look like a zip file, or its end is missing (still downloading?).";
         return false;
     }
     std::vector<uint8_t> tail(size_t(size - cdOff));
-    if (!ReadAt(h, cdOff, tail.data(), tail.size())) { err = L"Couldn't read the zip: " + ErrText(GetLastError()); return false; }
-    return ParseTail(tail.data(), tail.size(), cdOff, idx, err);
+    if (!arc.Read(cdOff, tail.data(), tail.size())) { err = L"Couldn't read the zip: " + ErrText(GetLastError()); return false; }
+    return ParseTail(tail.data(), tail.size(), cdOff, disks, idx, err);
 }
 
 // Reads the local header of every entry still in the zip to find where its data
 // starts, and checks that no entry's data runs into the next one: cutting the
 // zip at an entry must never damage another.
-bool ReadLocalHeaders(HANDLE h, uint64_t zipSize, ZipIndex& idx, std::wstring& err) {
+bool ReadLocalHeaders(Archive& arc, ZipIndex& idx, std::wstring& err) {
+    uint64_t zipSize = arc.size;
     for (size_t i = 0; i < idx.entries.size(); i++) {
         ZipEntry& e = idx.entries[i];
         if (e.offset >= zipSize) continue;   // already extracted and cut off
         uint8_t lh[30];
-        if (e.offset + 30 > zipSize || !ReadAt(h, e.offset, lh, 30) || rd32(lh) != 0x04034b50) {
+        if (e.offset + 30 > zipSize || !arc.Read(e.offset, lh, 30) || rd32(lh) != 0x04034b50) {
             err = L"The zip is damaged near \"" + e.name + L"\".";
             return false;
         }
@@ -431,64 +726,87 @@ Identity IdentityOf(HANDLE h) {
 }
 
 // The sidecar holds a copy of the central directory, which is cut off with the
-// last entry, plus what it takes to resume: which file it belongs to and where
-// the files were going.
-//   magic[8] tailOffset:u64 originalSize:u64 volume:u32 destLen:u32 file:u64 dest[destLen] tail
+// last entry, plus what it takes to resume: which archive it belongs to, the full
+// size of each of its parts, and where the files were going.
+//   magic[8] tailOffset:u64 kind:u32 parts:u32 volume:u32 destLen:u32 file:u64
+//   size[parts]:u64 dest[destLen] tail
+// Version 2, from ZeroZip 1.0 to 1.2, held one zip's original size where kind and
+// parts are now, and no sizes.
 constexpr size_t kSidecarHead = 40;
 
 enum class Sidecar { None, Stale, Ok, Bad };
 
-Sidecar ReadSidecar(const std::wstring& zip, HANDLE zh, ZipIndex& idx, std::wstring& err) {
-    Handle h(CreateFileW(SidecarPath(zip).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
+struct Resume {
+    SetKind kind = SetKind::Single;
+    std::vector<uint64_t> sizes;
+};
+
+std::vector<uint64_t> DisksOf(SetKind kind, const std::vector<uint64_t>& sizes) {
+    std::vector<uint64_t> d{0};
+    if (kind == SetKind::Spanned)
+        for (size_t i = 0; i + 1 < sizes.size(); i++) d.push_back(d.back() + sizes[i]);
+    return d;
+}
+
+Sidecar ReadSidecar(const std::wstring& first, Resume& r, ZipIndex& idx, std::wstring& err) {
+    Handle h(CreateFileW(SidecarPath(first).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
     if (!h) {
         DWORD code = GetLastError();
-        if (code == ERROR_FILE_NOT_FOUND) return Sidecar::None;
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return Sidecar::None;
         err = L"Couldn't read the resume file next to the zip: " + ErrText(code);
         return Sidecar::Bad;
     }
     uint64_t size = FileSize(h.h);
     uint8_t head[kSidecarHead];
-    if (size < kSidecarHead || size > (1ull << 31) || !ReadAt(h.h, 0, head, kSidecarHead) ||
-        memcmp(head, kSidecarMagic, 8) != 0)
-        return Sidecar::Stale;
-    uint64_t base = rd64(head + 8), original = rd64(head + 16);
-    Identity id{rd32(head + 24), rd64(head + 32)};
-    uint32_t destLen = rd32(head + 28);
-    Identity now = IdentityOf(zh);
+    if (size < kSidecarHead || size > (1ull << 31) || !ReadAt(h.h, 0, head, kSidecarHead)) return Sidecar::Stale;
+    bool v3 = memcmp(head, kSidecarMagic, 8) == 0, v2 = memcmp(head, "ZEROZIP2", 8) == 0;
+    if (!v2 && !v3) return Sidecar::Stale;
+    Handle zh(CreateFileW(first.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                          OPEN_EXISTING, 0, nullptr));
+    if (!zh) return Sidecar::None;
+    Identity id{rd32(head + 24), rd64(head + 32)}, now = IdentityOf(zh.h);
     if (id.volume != now.volume || id.file != now.file) return Sidecar::Stale;   // left over from another zip
-    if (kSidecarHead + uint64_t(destLen) * 2 > size) return Sidecar::Stale;
     std::vector<uint8_t> b(static_cast<size_t>(size - kSidecarHead));
     if (!ReadAt(h.h, kSidecarHead, b.data(), b.size())) { err = L"Couldn't read the resume file next to the zip."; return Sidecar::Bad; }
-    idx.dest.assign(reinterpret_cast<const wchar_t*>(b.data()), destLen);
-    size_t skip = size_t(destLen) * 2;
-    if (!ParseTail(b.data() + skip, b.size() - skip, base, idx, err)) return Sidecar::Bad;
-    // The zip may only ever have been cut at an entry boundary.
-    uint64_t zipSize = FileSize(zh);
-    bool atBoundary = zipSize == original;
-    for (auto& e : idx.entries) atBoundary = atBoundary || e.offset == zipSize;
-    if (!atBoundary) {
-        err = L"The zip has changed since ZeroZip last worked on it, so it can't be resumed safely.";
-        return Sidecar::Bad;
+    uint64_t base = rd64(head + 8);
+    size_t at = 0;
+    if (v3) {
+        uint32_t kind = rd32(head + 16), count = rd32(head + 20);
+        if (kind > uint32_t(SetKind::Spanned) || !count || uint64_t(count) * 8 > b.size()) return Sidecar::Stale;
+        r.kind = SetKind(kind);
+        for (uint32_t i = 0; i < count; i++) r.sizes.push_back(rd64(b.data() + 8 * i));
+        at = size_t(count) * 8;
+    } else {
+        r.kind = SetKind::Single;
+        r.sizes = {rd64(head + 16)};
     }
+    uint32_t destLen = rd32(head + 28);
+    if (at + uint64_t(destLen) * 2 > b.size()) return Sidecar::Stale;
+    idx.dest.assign(reinterpret_cast<const wchar_t*>(b.data() + at), destLen);
+    at += size_t(destLen) * 2;
+    if (!ParseTail(b.data() + at, b.size() - at, base, DisksOf(r.kind, r.sizes), idx, err)) return Sidecar::Bad;
     return Sidecar::Ok;
 }
 
-bool WriteSidecar(const std::wstring& zip, HANDLE zh, const ZipIndex& idx, const std::wstring& dest, std::wstring& err) {
-    std::wstring path = SidecarPath(zip), tmp = path + L".tmp";
+bool WriteSidecar(const Archive& arc, const ZipIndex& idx, const std::wstring& dest, std::wstring& err) {
+    std::wstring path = SidecarPath(arc.First()), tmp = path + L".tmp";
     uint8_t head[kSidecarHead] = {};
-    uint64_t original = FileSize(zh);
-    Identity id = IdentityOf(zh);
-    uint32_t destLen = uint32_t(dest.size());
+    Identity id = IdentityOf(arc.FirstHandle());
+    uint32_t kind = uint32_t(arc.kind), count = uint32_t(arc.parts.size()), destLen = uint32_t(dest.size());
     memcpy(head, kSidecarMagic, 8);
     memcpy(head + 8, &idx.tailOffset, 8);
-    memcpy(head + 16, &original, 8);
+    memcpy(head + 16, &kind, 4);
+    memcpy(head + 20, &count, 4);
     memcpy(head + 24, &id.volume, 4);
     memcpy(head + 28, &destLen, 4);
     memcpy(head + 32, &id.file, 8);
+    std::vector<uint64_t> sizes;
+    for (auto& p : arc.parts) sizes.push_back(p.size);
     {
         Handle h(CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr));
-        if (!h || !WriteAll(h.h, head, kSidecarHead) || !WriteAll(h.h, dest.data(), dest.size() * 2) ||
-            !WriteAll(h.h, idx.tail.data(), idx.tail.size()) || !FlushFileBuffers(h.h)) {
+        if (!h || !WriteAll(h.h, head, kSidecarHead) || !WriteAll(h.h, sizes.data(), sizes.size() * 8) ||
+            !WriteAll(h.h, dest.data(), dest.size() * 2) || !WriteAll(h.h, idx.tail.data(), idx.tail.size()) ||
+            !FlushFileBuffers(h.h)) {
             err = L"Couldn't save resume data next to the zip: " + ErrText(GetLastError());
             return false;
         }
@@ -517,13 +835,34 @@ bool WriteLostMarker(const std::wstring& zip, uint64_t offset) {
     return h && WriteAll(h.h, &offset, 8) && FlushFileBuffers(h.h);
 }
 
-// Loads the index from the sidecar when resuming, otherwise from the zip.
-bool LoadIndex(const std::wstring& zip, HANDLE zh, ZipIndex& idx, bool& resuming, std::wstring& err) {
-    Sidecar s = ReadSidecar(zip, zh, idx, err);
+// Opens the archive `path` is part of, and its index: from the sidecar if a stopped
+// run left one, otherwise from the archive itself.
+bool OpenArchive(const std::wstring& path, bool write, Archive& arc, ZipIndex& idx, bool& resuming, std::wstring& err) {
+    std::wstring first;
+    SetKind kind = KindOf(path, first);
+    Resume r;
+    Sidecar s = ReadSidecar(first, r, idx, err);
     if (s == Sidecar::Bad) return false;
     resuming = s == Sidecar::Ok;
-    if (!resuming && !ReadIndexFromZip(zh, idx, err)) return false;
-    return ReadLocalHeaders(zh, FileSize(zh), idx, err);
+    if (resuming) {
+        if (!arc.Open(r.kind, first, r.sizes, write, err)) return false;
+        // The archive may only ever have been cut at an entry boundary, or at the start
+        // of a part when deleting the parts after a cut was cut short. Any entry running
+        // across that start was extracted before its parts were deleted.
+        bool atBoundary = arc.size == arc.parts.back().start + arc.parts.back().size;
+        for (auto& e : idx.entries) atBoundary = atBoundary || e.offset == arc.size;
+        for (auto& p : arc.parts) atBoundary = atBoundary || (p.start && p.start == arc.size);
+        if (!atBoundary) {
+            err = L"The zip has changed since ZeroZip last worked on it, so it can't be resumed safely.";
+            return false;
+        }
+    } else {
+        idx = ZipIndex();
+        std::vector<uint64_t> sizes;
+        if (!FindParts(kind, first, sizes, err) || !arc.Open(kind, first, sizes, write, err) || !ReadIndexFromZip(arc, idx, err))
+            return false;
+    }
+    return ReadLocalHeaders(arc, idx, err);
 }
 
 const wchar_t* MethodProblem(const ZipEntry& e) {
@@ -551,11 +890,12 @@ struct Problems {
 
 // Fills in each entry's output path and finds entries that would fail partway
 // through a run, so they block it before anything is touched.
-void MapPaths(ZipIndex& idx, const std::wstring& destFull, const std::wstring& zipFull, Problems bad, bool& singleRoot) {
+void MapPaths(ZipIndex& idx, const std::wstring& destFull, const Archive& arc, Problems bad, bool& singleRoot) {
     std::wstring base = Extended(destFull);
     VolumeInfo vol = InfoOf(destFull);
-    const std::unordered_set<std::wstring> reserved = {Lower(Extended(zipFull)), Lower(Extended(SidecarPath(zipFull))),
-                                                       Lower(Extended(LostMarkerPath(zipFull)))};
+    std::unordered_set<std::wstring> reserved = {Lower(Extended(SidecarPath(arc.First()))),
+                                                 Lower(Extended(LostMarkerPath(arc.First())))};
+    for (auto& p : arc.parts) reserved.insert(Lower(Extended(p.path)));
     std::unordered_map<std::wstring, size_t> lastByName;
     for (size_t i = 0; i < idx.entries.size(); i++)
         if (!idx.entries[i].isDir) lastByName[idx.entries[i].name] = i;
@@ -625,16 +965,25 @@ void MapPaths(ZipIndex& idx, const std::wstring& destFull, const std::wstring& z
 std::wstring SidecarPath(const std::wstring& zip) { return zip + L".zerozip"; }
 std::wstring LostMarkerPath(const std::wstring& zip) { return zip + L".zerozip-lost"; }
 
+std::wstring ArchiveName(const std::wstring& path) {
+    std::wstring first;
+    SetKind kind = KindOf(path, first);
+    std::wstring leaf = Leaf(first);
+    if (kind == SetKind::Single) return leaf;
+    leaf.resize(leaf.find_last_of(L'.'));
+    return kind == SetKind::Spanned ? leaf + L".zip" : leaf;
+}
+
 bool Analyze(const std::wstring& zipIn, const std::wstring& destIn, Analysis& a, std::wstring& err) {
     a = Analysis();
-    a.zip = FullPath(zipIn);
-    Handle h(CreateFileW(a.zip.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                         OPEN_EXISTING, 0, nullptr));
-    if (!h) { err = L"Couldn't open the zip: " + ErrText(GetLastError()); return false; }
-    a.zipBytes = FileSize(h.h);
+    Archive arc;
     ZipIndex idx;
-    if (!LoadIndex(a.zip, h.h, idx, a.resuming, err)) return false;
-    h.Close();
+    if (!OpenArchive(FullPath(zipIn), false, arc, idx, a.resuming, err)) return false;
+    arc.Close();
+    a.zip = arc.First();
+    a.name = ArchiveName(a.zip);
+    a.parts = arc.parts.size();
+    a.zipBytes = arc.size;
 
     std::wstring zipDir = ParentOf(a.zip);
     std::vector<Problem> ignored;
@@ -646,13 +995,13 @@ bool Analyze(const std::wstring& zipIn, const std::wstring& destIn, Analysis& a,
     } else {
         // Like "smart extract" elsewhere: a zip with one top folder goes next to
         // the zip, anything else into a folder named after it.
-        MapPaths(idx, zipDir, a.zip, {ignored, ignoredCount}, a.singleRoot);
-        std::wstring stem = a.zip.substr(a.zip.find_last_of(L'\\') + 1);
+        MapPaths(idx, zipDir, arc, {ignored, ignoredCount}, a.singleRoot);
+        std::wstring stem = a.name;
         size_t dot = stem.find_last_of(L'.');
         if (dot != std::wstring::npos && dot > 0) stem.resize(dot);
         a.dest = a.singleRoot ? zipDir : FullPath(zipDir + L"\\" + stem);
     }
-    MapPaths(idx, a.dest, a.zip, {a.problems, a.problemCount}, a.singleRoot);
+    MapPaths(idx, a.dest, arc, {a.problems, a.problemCount}, a.singleRoot);
 
     a.volume = VolumeOf(ExistingAncestor(a.dest));
     a.sameVolume = SameVolume(a.zip, a.dest);
@@ -666,7 +1015,7 @@ bool Analyze(const std::wstring& zipIn, const std::wstring& destIn, Analysis& a,
 
     Problems bad{a.problems, a.problemCount};
     int64_t f = int64_t(a.freeBytes);
-    if (!a.resuming && a.sameVolume) f -= int64_t(onDisk(idx.tail.size() + kSidecarHead + a.dest.size() * 2));
+    if (!a.resuming && a.sameVolume) f -= int64_t(onDisk(idx.tail.size() + kSidecarHead + a.parts * 8 + a.dest.size() * 2));
     int64_t worst = f;
     uint64_t prevEnd = a.zipBytes;
     double total = double(std::max<uint64_t>(a.zipBytes, 1));
@@ -771,12 +1120,10 @@ bool Extractor::WaitIfPaused() {
 namespace {
 
 struct Job {
-    HANDLE zip;
-    uint64_t zipSize;
+    Archive& arc;
     std::wstring zipPath, dest;
     uint64_t freeCheckedAt = 0;
     uint64_t punchUnit = 64 << 10;     // freed ranges of a sparse file are rounded to this
-    bool zipSparse = false;
     uint64_t markerAt = UINT64_MAX;    // entry the lost-file marker points at
     std::vector<uint8_t> in = std::vector<uint8_t>(kChunk), out = std::vector<uint8_t>(kChunk);
     ZSTD_DCtx* zstd = nullptr;
@@ -784,8 +1131,7 @@ struct Job {
     Extractor::ProgressFn onProgress;
     std::function<bool()> keepGoing;
 
-    Job(HANDLE z, std::wstring zp, std::wstring d)
-        : zip(z), zipSize(FileSize(z)), zipPath(std::move(zp)), dest(std::move(d)) {}
+    Job(Archive& a, std::wstring d) : arc(a), zipPath(a.First()), dest(std::move(d)) {}
     ~Job() { if (zstd) ZSTD_freeDCtx(zstd); }
 
     void Tick(uint64_t bytes) {
@@ -833,15 +1179,12 @@ struct Job {
     // With `punch`, the entry's zip data is freed as it is used, for files too big
     // for the free space.
     bool Extract(const ZipEntry& e, bool punch, std::wstring& err) {
-        if (e.data + e.csize > zipSize) { err = L"The zip is damaged near \"" + e.name + L"\"."; return false; }
+        if (e.data + e.csize > arc.size) { err = L"The zip is damaged near \"" + e.name + L"\"."; return false; }
         if (punch) {
-            DWORD ret = 0;
-            FILE_SET_SPARSE_BUFFER sb{TRUE};
-            if (!zipSparse && !DeviceIoControl(zip, FSCTL_SET_SPARSE, &sb, sizeof sb, nullptr, 0, &ret, nullptr)) {
+            if (!arc.MakeSparse(e.data, e.data + e.csize)) {
                 err = L"Couldn't prepare the zip for freeing space partway through a file: " + ErrText(GetLastError());
                 return false;
             }
-            zipSparse = true;
             if (!WriteLostMarker(zipPath, e.offset)) {
                 err = L"Couldn't save resume data next to the zip: " + ErrText(GetLastError());
                 return false;
@@ -884,23 +1227,19 @@ struct Job {
         auto release = [&] {
             uint64_t to = pos / punchUnit * punchUnit;
             if (!punch || to < punchFrom + kWindow) return true;
-            FILE_ZERO_DATA_INFORMATION z{};
-            z.FileOffset.QuadPart = LONGLONG(punchFrom);
-            z.BeyondFinalZero.QuadPart = LONGLONG(to);
-            DWORD ret = 0;
-            if (!FlushFileBuffers(file.h) || !DeviceIoControl(zip, FSCTL_SET_ZERO_DATA, &z, sizeof z, nullptr, 0, &ret, nullptr)) {
+            if (!FlushFileBuffers(file.h) || !arc.Punch(punchFrom, to)) {
                 why = L"couldn't free its zip data: " + ErrText(GetLastError());
                 return false;
             }
             punched += to - punchFrom;
             punchFrom = to;
-            prog.zipBytes = zipSize - punched;
+            prog.zipBytes = arc.size - punched;
             return true;
         };
         auto readChunk = [&](size_t& n) {
             if (!release()) return false;
             n = size_t(std::min<uint64_t>(left, kChunk));
-            if (n && !ReadAt(zip, pos, in.data(), n)) { why = L"couldn't read the zip: " + ErrText(GetLastError()); return false; }
+            if (n && !arc.Read(pos, in.data(), n)) { why = L"couldn't read the zip: " + ErrText(GetLastError()); return false; }
             pos += n;
             left -= n;
             return true;
@@ -999,25 +1338,8 @@ struct Job {
     }
 
     bool Truncate(uint64_t at, std::wstring& err) {
-        if (at >= zipSize) return true;
-        FILE_END_OF_FILE_INFO eof{};
-        eof.EndOfFile.QuadPart = LONGLONG(at);
-        if (!SetFileInformationByHandle(zip, FileEndOfFileInfo, &eof, sizeof eof) || !FlushFileBuffers(zip)) {
-            err = L"Couldn't shrink the zip: " + ErrText(GetLastError());
-            return false;
-        }
-        // Moving the end alone keeps the clusters reserved until the handle closes;
-        // shrinking the allocation too gives them back to the drive right away. Only
-        // ever shrink it: a sparse zip with freed ranges has less allocated than `at`.
-        FILE_STANDARD_INFO info{};
-        if (GetFileInformationByHandleEx(zip, FileStandardInfo, &info, sizeof info) &&
-            uint64_t(info.AllocationSize.QuadPart) > at) {
-            FILE_ALLOCATION_INFO alloc{};
-            alloc.AllocationSize.QuadPart = LONGLONG(at);
-            SetFileInformationByHandle(zip, FileAllocationInfo, &alloc, sizeof alloc);
-        }
-        zipSize = at;
-        prog.zipBytes = at;
+        if (!arc.Cut(at, err)) return false;
+        prog.zipBytes = arc.size;
         return true;
     }
 };
@@ -1027,22 +1349,16 @@ struct Job {
 bool Extractor::Run(const std::wstring& zipIn, const std::wstring& destIn, ProgressFn onProgress, LogFn onFile,
                     std::wstring& err) {
     err.clear();
-    std::wstring zip = FullPath(zipIn), dest = FullPath(destIn);
-    Handle zh(CreateFileW(zip.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr));
-    if (!zh) {
-        DWORD code = GetLastError();
-        err = code == ERROR_SHARING_VIOLATION
-                  ? L"Another app has the zip open. Close WinRAR, 7-Zip or anything else using it, then try again."
-                  : L"Couldn't open the zip: " + ErrText(code);
-        return false;
-    }
+    std::wstring dest = FullPath(destIn);
+    Archive arc;
     ZipIndex idx;
     bool resuming = false;
-    if (!LoadIndex(zip, zh.h, idx, resuming, err)) return false;
+    if (!OpenArchive(FullPath(zipIn), true, arc, idx, resuming, err)) return false;
+    std::wstring zip = arc.First();
     std::vector<Problem> bad;
     size_t badCount = 0;
     bool singleRoot;
-    MapPaths(idx, dest, zip, {bad, badCount}, singleRoot);
+    MapPaths(idx, dest, arc, {bad, badCount}, singleRoot);
     if (badCount) {
         err = L"\"" + bad[0].name + L"\" can't be extracted: " + bad[0].reason + L".";
         return false;
@@ -1052,12 +1368,12 @@ bool Extractor::Run(const std::wstring& zipIn, const std::wstring& destIn, Progr
         return false;
     }
 
-    Job r(zh.h, zip, dest);
+    Job r(arc, dest);
     if (resuming) {
         ReadLostMarker(zip, r.markerAt);
     } else {
         DeleteFileW(LostMarkerPath(zip).c_str());
-        if (!WriteSidecar(zip, zh.h, idx, dest, err)) return false;
+        if (!WriteSidecar(arc, idx, dest, err)) return false;
     }
     VolumeInfo zipVol = InfoOf(ParentOf(zip));
     r.punchUnit = std::max<uint64_t>(64 << 10, zipVol.cluster * 16);
@@ -1069,7 +1385,7 @@ bool Extractor::Run(const std::wstring& zipIn, const std::wstring& destIn, Progr
         r.prog.total++;
         if (!e.isDir && !e.path.empty()) r.prog.bytesTotal += e.size;
     }
-    r.prog.zipBytes = r.zipSize;
+    r.prog.zipBytes = arc.size;
     r.prog.freeBytes = FreeOn(dest);
     r.onProgress(r.prog);
 
@@ -1082,7 +1398,7 @@ bool Extractor::Run(const std::wstring& zipIn, const std::wstring& destIn, Progr
         } else if (!e.shadowed) {
             if (!MakeDirs(ParentOf(e.path))) { err = L"Couldn't create folder for \"" + e.name + L"\": " + ErrText(GetLastError()); return false; }
             std::wstring tmp = e.path + kTemp;
-            bool gone = e.offset >= r.zipSize;
+            bool gone = e.offset >= arc.size;
             bool lost = e.offset == r.markerAt;
             auto st = r.Matches(e.path, e);
             if (st != Job::Check::Ok && st != Job::Check::Stopped) {
@@ -1127,8 +1443,7 @@ bool Extractor::Run(const std::wstring& zipIn, const std::wstring& destIn, Progr
         r.prog.freeBytes = FreeOn(dest);
         r.onProgress(r.prog);
     }
-    zh.Close();
-    if (!DeleteFileW(zip.c_str())) { err = L"Everything was extracted, but the empty zip couldn't be deleted: " + ErrText(GetLastError()); return false; }
+    if (!arc.Remove(err)) return false;
     DeleteFileW(SidecarPath(zip).c_str());
     DeleteFileW(LostMarkerPath(zip).c_str());
     return true;

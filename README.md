@@ -18,7 +18,7 @@ The exe isn't code-signed yet, so Windows SmartScreen may warn the first time: c
 
 ## Right-click menu
 
-The switch on the first screen adds **Extract with ZeroZip** to the right-click menu of zip files, for your Windows account only. It sits next to WinRAR or 7-Zip without changing which app opens zips.
+The switch on the first screen adds **Extract with ZeroZip** to the right-click menu of zip files and split zips (any part on Windows 11, the first part on Windows 10), for your Windows account only. It sits next to WinRAR or 7-Zip without changing which app opens zips.
 
 - **Windows 11:** the entry is at the top of the menu. Windows only allows that for an app package, so ZeroZip installs a small one (`assets/package`) that points Explorer at `ZeroZipShell.dll` in `%LOCALAPPDATA%\Programs\ZeroZip`. The package isn't signed, so turning the switch on asks for admin once. Turning it off doesn't.
 - **Windows 10:** the entry is a plain registry entry, with no admin needed.
@@ -35,6 +35,15 @@ A zip stores its files one after another, with an index at the end. ZeroZip:
 4. Repeats, working towards the front, until the zip is empty. Then it deletes the zip.
 
 Files that are already in the destination folder, for example from a WinRAR run that ran out of space, are CRC-checked and kept instead of being written again.
+
+### Split zips
+
+Zips that come in parts work the same way, opened from any of their parts:
+
+- **Split**, as 7-Zip makes them: `Game.zip.001`, `Game.zip.002`, …, which is one zip cut into pieces.
+- **Spanned**, as WinZip and WinRAR make them: `Game.z01`, `Game.z02`, …, `Game.zip`.
+
+ZeroZip reads the parts as one zip. As the cut moves back past the start of a part, that part is deleted, so the parts disappear one by one from the last. The resume data sits next to the first part, which goes last. A set with a part missing is refused before anything is touched, naming the missing part where it can.
 
 Before starting, ZeroZip simulates the whole run against your actual free space and shows:
 - the lowest point free space will reach,
@@ -77,8 +86,9 @@ FAT32 and exFAT drives can't free part of a file, so there the biggest file has 
 |---|---|
 | Compression | Store, Deflate, Zstandard |
 | Sizes | ZIP64 (files and archives over 4 GB) |
+| Parts | split (`.zip.001`, …) and spanned (`.z01`, …, `.zip`) |
 | Names | UTF-8, legacy code-page names, Info-ZIP Unicode path extra |
-| Not supported | Deflate64, BZip2, LZMA, XZ, PPMd, encrypted zips, split zips, self-extractors |
+| Not supported | Deflate64, BZip2, LZMA, XZ, PPMd, encrypted zips, self-extractors |
 
 Only zip for now. RAR could be extracted in place too: front to back with hole punching, or for non-solid archives back to front like zips. But that needs the official unrar decoder and is not done yet.
 

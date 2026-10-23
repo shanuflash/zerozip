@@ -29,7 +29,26 @@ std::wstring ExePath() {
     return std::wstring(path) + L"\\ZeroZip.exe";
 }
 
-// The zip's path, if exactly one zip is selected.
+// Zips, and the parts of split ones: Game.zip.001, .002, ... and Game.z01, .z02, ...
+bool IsZip(const std::wstring& path) {
+    const wchar_t* ext = PathFindExtensionW(path.c_str());
+    if (lstrcmpiW(ext, L".zip") == 0) return true;
+    auto digits = [](const wchar_t* s) {
+        if (!*s) return false;
+        for (; *s; s++)
+            if (*s < L'0' || *s > L'9') return false;
+        return true;
+    };
+    if (lstrlenW(ext) < 4) return false;   // ".z01" and ".001" at the least
+    if ((ext[1] == L'z' || ext[1] == L'Z') && digits(ext + 2)) return true;
+    if (digits(ext + 1)) {
+        std::wstring stem = path.substr(0, path.size() - lstrlenW(ext));
+        return lstrcmpiW(PathFindExtensionW(stem.c_str()), L".zip") == 0;
+    }
+    return false;
+}
+
+// The zip's path, if exactly one zip, or one part of a split zip, is selected.
 std::wstring OnlyZip(IShellItemArray* items) {
     DWORD n = 0;
     IShellItem* item = nullptr;
@@ -40,7 +59,7 @@ std::wstring OnlyZip(IShellItemArray* items) {
     if (FAILED(hr)) return {};
     std::wstring s = path;
     CoTaskMemFree(path);
-    return lstrcmpiW(PathFindExtensionW(s.c_str()), L".zip") == 0 ? s : std::wstring();
+    return IsZip(s) ? s : std::wstring();
 }
 
 class Command : public IExplorerCommand {
