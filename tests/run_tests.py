@@ -9,6 +9,7 @@ import zstandard
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZZ = os.path.join(ROOT, "build", "zztest.exe")
+RAR = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WinRAR", "Rar.exe")   # makes the RAR test archives
 
 
 def dos_time(t=(2024, 5, 17, 13, 45, 30)):
@@ -446,18 +447,23 @@ def main():
         assert not any(os.path.exists(p) for p in parts)
     ok("split zips delete used-up parts from the end, and resume")
 
+    # Whichever part is missing, nothing is touched and the message names it (a split
+    # zip's last part can't be told apart from the end of the set).
     for kind, make in kinds:
-        parts = make(kind + "-gap")
-        os.rename(parts[1], parts[1] + ".away")
-        sizes = [os.path.getsize(p) for p in parts if os.path.exists(p)]
-        code, out = run("plan", parts[0], os.path.join(work, kind + "-out3"))
-        assert code == 1 and "missing" in out, out
-        code, out = run("run", parts[0], os.path.join(work, kind + "-out3"))
-        assert code == 1 and "missing" in out, out
-        assert [os.path.getsize(p) for p in parts if os.path.exists(p)] == sizes and not os.path.exists(parts[0] + ".zerozip")
-        if kind == "split":
-            assert os.path.basename(parts[1]) in out, out   # says which one
-    ok("a split zip with a part missing is refused untouched")
+        for which in ("middle", "first", "next-to-last", "last"):
+            parts = make("%s-gap-%s" % (kind, which))
+            gap = {"middle": 1, "first": 0, "next-to-last": len(parts) - 2, "last": len(parts) - 1}[which]
+            os.rename(parts[gap], parts[gap] + ".away")
+            opened = parts[2] if gap != 2 else parts[3]
+            sizes = [os.path.getsize(p) for p in parts if os.path.exists(p)]
+            for mode in ("plan", "run"):
+                code, out = run(mode, opened, os.path.join(work, kind + "-out3"))
+                assert code == 1 and "missing" in out, (kind, which, out)
+                if not (kind == "split" and which == "last"):
+                    assert os.path.basename(parts[gap]) in out, (kind, which, out)
+            assert [os.path.getsize(p) for p in parts if os.path.exists(p)] == sizes
+            assert not os.path.exists(parts[0] + ".zerozip")
+    ok("a split zip with a part missing is refused untouched, naming the part")
 
     # A crash between shrinking one part and deleting the next leaves that next part behind.
     parts = split_file(fresh("leftover.zip", entries), part)
@@ -514,6 +520,125 @@ def main():
         expect_tree(d, expected)
         assert not any(os.path.exists(p) for p in parts)
     ok("hole-punch mode works across the parts of a split zip")
+
+    # RAR, made by WinRAR's own Rar.exe when it's installed
+    if not os.path.exists(RAR):
+        print("--  RAR tests skipped: WinRAR's Rar.exe isn't installed")
+    else:
+        src = os.path.join(work, "rar-src")
+        rar_files = {n: d for n, d in files.items() if n != "Game/CON.txt"}   # Windows can't make a file called CON
+        for n, data in rar_files.items():
+            path = os.path.join(src, *n.split("/"))
+            if data is None:
+                os.makedirs(path, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                open(path, "wb").write(data)
+        rar_expected = dict(rar_files)
+
+        def make_rar(name, *args):
+            out = os.path.join(work, name)
+            os.makedirs(out)
+            subprocess.run([RAR, "a", "-ep1", "-r", "-y", "-idq", *args, os.path.join(out, "Game.rar"), os.path.join(src, "Game")],
+                           check=True, capture_output=True)
+            return sorted(os.path.join(out, f) for f in os.listdir(out))
+
+        vols = make_rar("rar-full", "-v4m")
+        assert len(vols) >= 4 and ".part" in vols[0] and vols[0].endswith("1.rar"), vols
+        d = os.path.join(work, "rar-out1")
+        code, out = run("plan", vols[2], d)   # any volume opens the set
+        assert code == 0 and "problems=0" in out, out
+        code, out = run("run", vols[2], d)
+        assert code == 0 and out.strip().endswith("done"), out
+        expect_tree(d, rar_expected)
+        assert not any(os.path.exists(v) for v in vols) and not os.listdir(os.path.dirname(vols[0]))
+        one = make_rar("rar-one")
+        d = os.path.join(work, "rar-out1b")
+        code, out = run("run", one[0], d)
+        assert code == 0 and "done" in out and not os.path.exists(one[0]), out
+        expect_tree(d, rar_expected)
+        ok("RAR in volumes and in one file, opened from any volume")
+
+        vols = make_rar("rar-resume", "-v4m")
+        d = os.path.join(work, "rar-out2")
+        code, out = run("run", vols[0], d, "--stop-after", "3")
+        assert code == 3 and "stopped" in out, out
+        left = [v for v in vols if os.path.exists(v)]
+        assert left and len(left) < len(vols) and left == vols[-len(left):], left   # volumes go from the front
+        code, out = run("plan", left[0])
+        assert "resuming=1" in out and "problems=0" in out and "dest=%s\n" % d in out, out
+        code, out = run("run", left[0], d)
+        assert code == 0 and "done" in out, out
+        expect_tree(d, rar_expected)
+        assert not any(os.path.exists(v) for v in vols)
+        # the first volume, already deleted, still opens the stopped run
+        vols = make_rar("rar-resume2", "-v4m")
+        d = os.path.join(work, "rar-out2b")
+        code, out = run("run", vols[0], d, "--stop-after", "3")
+        assert code == 3 and not os.path.exists(vols[0]), out
+        code, out = run("run", vols[0], d)
+        assert code == 0 and "done" in out, out
+        expect_tree(d, rar_expected)
+        ok("RAR volumes are deleted from the front, and it resumes from the first one left")
+
+        # files named like volumes that aren't part of the set are left alone
+        one = make_rar("rar-stray")
+        stray = os.path.join(os.path.dirname(one[0]), "Game.r00")
+        open(stray, "wb").write(b"not part of it")
+        vols = make_rar("rar-stray2", "-v10m")
+        extra = vols[0].replace("1.rar", "9.rar")
+        shutil.copy(one[0], extra)
+        for first, keep in ((one[0], stray), (vols[0], extra)):
+            code, out = run("run", first, os.path.join(work, "rar-out7", os.path.basename(keep)))
+            assert code == 0 and "done" in out, out
+            assert os.path.exists(keep), keep
+        ok("files named like a RAR's parts but not part of it are left alone")
+
+        # a file with an NTFS stream: the stream isn't kept, the file is
+        streams = os.path.join(work, "rar-streams-src")
+        os.makedirs(os.path.join(streams, "Game"))
+        open(os.path.join(streams, "Game", "a.txt"), "wb").write(b"main data")
+        open(os.path.join(streams, "Game", "a.txt") + ":extra", "wb").write(b"stream data" * 1000)
+        out_dir = os.path.join(work, "rar-streams")
+        os.makedirs(out_dir)
+        subprocess.run([RAR, "a", "-ep1", "-r", "-y", "-idq", "-os", os.path.join(out_dir, "S.rar"), os.path.join(streams, "Game")],
+                       check=True, capture_output=True)
+        d = os.path.join(work, "rar-out8")
+        code, out = run("run", os.path.join(out_dir, "S.rar"), d)
+        assert code == 0 and "done" in out, out
+        assert open(os.path.join(d, "Game", "a.txt"), "rb").read() == b"main data"
+        ok("RAR with NTFS streams")
+
+        vols = make_rar("rar-solid", "-v4m", "-s")
+        d = os.path.join(work, "rar-out3")
+        code, out = run("run", vols[0], d, "--stop-after", "4")
+        assert code == 3, out
+        assert all(os.path.exists(v) for v in vols), out   # plenty of room: nothing deleted, so it can resume
+        code, out = run("run", vols[0], d)
+        assert code == 0 and "done" in out and out.count("ok   ") == 4, out
+        expect_tree(d, rar_expected)
+        ok("a solid RAR with room keeps its volumes until the end, so it can resume")
+
+        vols = make_rar("rar-gap", "-v4m")
+        os.rename(vols[2], vols[2] + ".away")
+        sizes = [os.path.getsize(v) for v in vols if os.path.exists(v)]
+        code, out = run("run", vols[0], os.path.join(work, "rar-out4"))
+        assert code == 1 and os.path.basename(vols[2]) in out and "missing" in out, out
+        assert [os.path.getsize(v) for v in vols if os.path.exists(v)] == sizes
+        locked = make_rar("rar-locked", "-psecret")
+        code, out = run("plan", locked[0], os.path.join(work, "rar-out5"))
+        assert "password protected" in out, out
+        locked = make_rar("rar-locked-names", "-hpsecret")
+        code, out = run("plan", locked[0], os.path.join(work, "rar-out5"))
+        assert code == 1 and "password protected" in out, out
+        ok("a RAR with a volume missing, or a password, is refused untouched")
+
+        vols = make_rar("rar-blake", "-v4m", "-htb")
+        d = os.path.join(work, "rar-out6")
+        code, out = run("run", vols[0], d)
+        assert code == 0 and "done" in out, out
+        expect_tree(d, rar_expected)
+        ok("RAR with BLAKE2 checksums")
 
     shutil.rmtree(work, ignore_errors=True)
     print("\n%d groups passed" % passed)

@@ -283,8 +283,8 @@ float DrawHome(float W) {
     g_gfx.Fill(tile, t.accentTint, 15);
     g_gfx.Stroke(tile, t.accentLine, 15);
     g_gfx.Text(kGlyphDownload, Font::Icon28, R(tile.left, y + 11, 52, 32), t.accent, Align::Center);
-    g_gfx.Text(L"Drop a zip here", Font::Subtitle, R(kPad, y + 64, w, 28), t.text1, Align::Center);
-    std::wstring choose = L"Choose zip";
+    g_gfx.Text(L"Drop a zip or RAR here", Font::Subtitle, R(kPad, y + 64, w, 28), t.text1, Align::Center);
+    std::wstring choose = L"Choose file";
     Button(kBrowse, cx - ButtonWidth(choose, Kind::Primary) / 2, y + 104, choose, Kind::Primary);
     y = kPad + 196 + 12;
     D2D1_RECT_F menu = R(kPad, y, w, 60);   // the whole row toggles it
@@ -293,7 +293,7 @@ float DrawHome(float W) {
     g_gfx.Text(L"Right-click menu", Font::BodyStrong, R(kPad + 18, y + 10, w - 100, 20), t.text1);
     if (g_menuBusy) g_gfx.Text(L"Waiting for Windows\u2026", Font::Caption, R(kPad + 18, y + 32, w - 100, 16), t.text2);
     else if (!g_menuNote.empty()) g_gfx.Text(g_menuNote, Font::Caption, R(kPad + 18, y + 32, w - 100, 16), t.warn);
-    else g_gfx.Text(L"Extract with ZeroZip, on any zip", Font::Caption, R(kPad + 18, y + 32, w - 100, 16), t.text2);
+    else g_gfx.Text(L"Extract with ZeroZip, on zips and RARs", Font::Caption, R(kPad + 18, y + 32, w - 100, 16), t.text2);
     Switch(kMenu, kPad + w - 18 - 40, y + 19, g_menu);
     y += 60;
     if (g_drives.empty()) return y;
@@ -325,7 +325,7 @@ void BusyBar(float x, float y, float w) {
 float DrawReading(float W) {
     float w = W - 2 * kPad;
     g_gfx.Text(g_zipName, Font::Subtitle, R(kPad, kPad, w, 28), g_gfx.theme.text1);
-    g_gfx.Text(L"Reading the zip\u2026", Font::Body, R(kPad, kPad + 32, w, 20), g_gfx.theme.text2);
+    g_gfx.Text(L"Reading its list of files\u2026", Font::Body, R(kPad, kPad + 32, w, 20), g_gfx.theme.text2);
     BusyBar(kPad, kPad + 66, w);
     Buttons(W - kPad, kPad + 92, {{kCancel, L"Cancel"}}, Kind::Ghost);
     return kPad + 92 + kButtonH;
@@ -347,7 +347,7 @@ float DrawReady(float W) {
         std::wstring msg;
         for (size_t i = 0; i < std::min<size_t>(a.problems.size(), 3); i++)
             msg += (i ? L"\n" : L"") + Leaf(a.problems[i].name) + L": " + a.problems[i].reason;
-        y += Notice(x, y, w, Tone::Bad, L"Can't extract this zip", msg) + 10;
+        y += Notice(x, y, w, Tone::Bad, a.rar ? L"Can't extract this RAR" : L"Can't extract this zip", msg) + 10;
     } else if (a.minFree >= int64_t(a.margin)) {
         y += Notice(x, y, w, Tone::Good, L"Fits on " + vol, L"") + 10;
     } else {
@@ -359,8 +359,12 @@ float DrawReady(float W) {
     else if (a.resuming)
         y += Notice(x, y, w, Tone::Good, L"Continuing where it stopped", L"") + 10;
     if (!a.sameVolume)
-        y += Notice(x, y, w, Tone::Warn, L"The zip and the folder are on different drives",
+        y += Notice(x, y, w, Tone::Warn, a.rar ? L"The RAR and the folder are on different drives" : L"The zip and the folder are on different drives",
                     L"The folder's drive needs room for every file.") + 10;
+    if (a.solidRisk)
+        y += Notice(x, y, w, Tone::Warn, L"Solid RAR: let it finish",
+                    L"Its parts can only be read from the start, so once the first is deleted, it can't be stopped and resumed. "
+                    L"Pausing is fine.") + 10;
     if (a.punchFiles) {
         std::wstring names;
         for (auto& n : a.punchNames) names += (names.empty() ? L"" : L", ") + Leaf(n);
@@ -380,7 +384,10 @@ float DrawReady(float W) {
     Button(kChange, in.right - 14 - cw, in.top + (in.bottom - in.top - kButtonH) / 2, change, Kind::Ghost);
     y += 72 + 18;
 
-    g_gfx.Text(a.parts > 1 ? L"Its parts are deleted as it extracts." : L"The zip is deleted as it extracts.", Font::Caption,
+    g_gfx.Text(a.parts > 1 ? L"Its parts are deleted as it extracts."
+               : a.rar     ? L"The RAR is deleted once it's extracted."
+                           : L"The zip is deleted as it extracts.",
+               Font::Caption,
                R(x, y + 10, w - 200, 16), t.text3);
     Buttons(W - kPad, y, {{kCancel, L"Cancel"}, {kExtract, L"Extract"}}, Kind::Primary, CanExtract());
     return y + kButtonH;
@@ -458,7 +465,7 @@ float DrawRunning(float W) {
     bool stopping = g_ex.Stopped();
     g_gfx.Text(stopping ? L"Stopping after this file" : pct, Font::Title, R(x, y, w - 100, 40), t.text1);
     Button(kPause, W - kPad - 2 * kButtonH - 8, y + 2, L"", Kind::Icon, !stopping, g_paused ? kGlyphPlay : kGlyphPause);
-    Button(kStop, W - kPad - kButtonH, y + 2, L"", Kind::Icon, !stopping, kGlyphClose);
+    Button(kStop, W - kPad - kButtonH, y + 2, L"", Kind::Icon, !stopping && !p.unstoppable, kGlyphClose);
     y += 50;
 
     SpeedGraph(R(x, y, w, 150));
@@ -500,8 +507,8 @@ float DrawEnd(float W) {
             break;
         case EndKind::CantOpen:
             fg = t.danger; tint = t.dangerTint; glyph = kGlyphError;
-            title = L"Can't open this zip";
-            buttons = {{kAnother, L"Choose another zip"}, {kRetry, L"Try again"}};
+            title = L"Can't open this";
+            buttons = {{kAnother, L"Choose another"}, {kRetry, L"Try again"}};
             break;
     }
     D2D1_POINT_2F c = {x + 22, y + 22};
@@ -576,7 +583,7 @@ void LoadDrives() {
 // ZeroZipShell.dll; an unsigned package takes admin to install, so turning the menu on asks
 // once, and turning it off doesn't. Windows 10 gets a plain registry entry.
 // Both are for this user only, and go on zips whichever app owns them.
-const wchar_t* const kMenuTypes[] = {L".zip", L".z01", L".001"};   // zips, and the first part of a split one
+const wchar_t* const kMenuTypes[] = {L".zip", L".z01", L".001", L".rar"};   // zips, the first part of a split one, and RARs
 
 std::wstring MenuKey(const wchar_t* type) {
     return std::wstring(L"Software\\Classes\\SystemFileAssociations\\") + type + L"\\shell\\ZeroZip";
@@ -941,9 +948,9 @@ void StartRun() {
                 [](const std::wstring&, uint64_t, FileResult) {},
                 r->err);
         } catch (const std::bad_alloc&) {
-            r->err = L"ZeroZip ran out of memory. Everything done so far is kept; open the zip again to resume.";
+            r->err = L"ZeroZip ran out of memory. Everything done so far is kept; open it again to resume.";
         } catch (const std::exception&) {
-            r->err = L"Something went wrong. Everything done so far is kept; open the zip again to resume.";
+            r->err = L"Something went wrong. Everything done so far is kept; open it again to resume.";
         }
         r->stopped = !r->ok && r->err.empty();
         if (!PostMessageW(g_hwnd, WM_APP_DONE, 0, (LPARAM)r)) delete r;
@@ -962,7 +969,7 @@ void OnDone(RunResult* r) {
     if (r->ok) {
         ShowEnd(EndKind::Done, L"Extracted to " + Compact(g_a.dest, 290));
     } else if (r->stopped) {
-        ShowEnd(EndKind::Stopped, L"Open the zip again any time to continue.");
+        ShowEnd(EndKind::Stopped, L"Open it again any time to continue.");
     } else {
         FlashWindow(g_hwnd, TRUE);
         ShowEnd(EndKind::Problem, r->err);
@@ -989,9 +996,9 @@ std::wstring Pick(bool folder, const std::wstring& start) {
         Microsoft::WRL::ComPtr<IShellItem> at;
         if (!dir.empty() && SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, IID_PPV_ARGS(&at)))) d->SetFolder(at.Get());
     } else {
-        COMDLG_FILTERSPEC spec[] = {{L"Zip archives", L"*.zip;*.z01;*.001"}, {L"All files", L"*.*"}};
+        COMDLG_FILTERSPEC spec[] = {{L"Zip and RAR archives", L"*.zip;*.z01;*.001;*.rar"}, {L"All files", L"*.*"}};
         d->SetFileTypes(2, spec);
-        d->SetTitle(L"Choose a zip to extract");
+        d->SetTitle(L"Choose a zip or RAR to extract");
     }
     Microsoft::WRL::ComPtr<IShellItem> item;
     PWSTR path = nullptr;
@@ -1185,9 +1192,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CLOSE:
             if (g_running) {
                 if (g_closing) return 0;
+                if (g_prog.unstoppable) {
+                    MessageBoxW(hwnd,
+                                L"This solid RAR can't be stopped partway now: its first part is gone, and the rest can only be "
+                                L"read after it. Let it finish, or pause it.",
+                                L"ZeroZip", MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
                 int r = MessageBoxW(hwnd,
                                     L"ZeroZip is still extracting.\n\nStop and close? Everything done so far is kept, "
-                                    L"and opening the zip again picks up where it stopped.",
+                                    L"and opening it again picks up where it stopped.",
                                     L"ZeroZip", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2);
                 if (r != IDOK) return 0;
                 // The window closes once the run has stopped; a file being freed as it

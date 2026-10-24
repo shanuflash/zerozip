@@ -6,6 +6,7 @@
 #include <shlwapi.h>
 #include <shobjidl.h>
 
+#include <cwctype>
 #include <new>
 #include <string>
 
@@ -29,10 +30,11 @@ std::wstring ExePath() {
     return std::wstring(path) + L"\\ZeroZip.exe";
 }
 
-// Zips, and the parts of split ones: Game.zip.001, .002, ... and Game.z01, .z02, ...
+// Zips, the parts of split ones (Game.zip.001, .002, ... and Game.z01, .z02, ...),
+// and RARs (Game.rar, Game.part1.rar, ..., and old-style Game.r00, ...).
 bool IsZip(const std::wstring& path) {
     const wchar_t* ext = PathFindExtensionW(path.c_str());
-    if (lstrcmpiW(ext, L".zip") == 0) return true;
+    if (lstrcmpiW(ext, L".zip") == 0 || lstrcmpiW(ext, L".rar") == 0) return true;
     auto digits = [](const wchar_t* s) {
         if (!*s) return false;
         for (; *s; s++)
@@ -40,7 +42,8 @@ bool IsZip(const std::wstring& path) {
         return true;
     };
     if (lstrlenW(ext) < 4) return false;   // ".z01" and ".001" at the least
-    if ((ext[1] == L'z' || ext[1] == L'Z') && digits(ext + 2)) return true;
+    wchar_t c = wchar_t(towlower(ext[1]));
+    if ((c == L'z' || c == L'r') && digits(ext + 2)) return true;
     if (digits(ext + 1)) {
         std::wstring stem = path.substr(0, path.size() - lstrlenW(ext));
         return lstrcmpiW(PathFindExtensionW(stem.c_str()), L".zip") == 0;

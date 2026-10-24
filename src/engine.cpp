@@ -8,12 +8,14 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
 #include <winioctl.h>
 
 #include "../third_party/miniz/miniz.h"
+#include "../third_party/unrar/dll.hpp"
 #define ZSTD_STATIC_LINKING_ONLY   // for ZSTD_WINDOWLOG_MAX
 #include "../third_party/zstd/zstd.h"
 
@@ -317,6 +319,10 @@ bool Exists(const std::wstring& p) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+bool AllDigits(const std::wstring& s) {
+    return !s.empty() && std::all_of(s.begin(), s.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+}
+
 // Which kind of set `path` looks like it belongs to, and that set's first part, from
 // the names alone. A part that isn't next to its first part is read on its own.
 SetKind KindOf(const std::wstring& path, std::wstring& first) {
@@ -532,6 +538,11 @@ bool FindParts(SetKind kind, const std::wstring& first, std::vector<uint64_t>& s
         sizes.push_back(s);
     }
     if (kind == SetKind::Spanned) {
+        for (size_t k = 1; k <= 3; k++)   // a .zNN found after a gap: the gap is a missing part
+            if (Exists(PartPath(first, kind, sizes.size() + k, SIZE_MAX))) {
+                err = L"\"" + Leaf(PartPath(first, kind, sizes.size(), SIZE_MAX)) + L"\" is missing.";
+                return false;
+            }
         uint64_t s = 0;
         std::wstring last = PartPath(first, kind, sizes.size(), sizes.size() + 1);
         if (!sizeOf(last, s)) { err = L"The last part, \"" + Leaf(last) + L"\", is missing."; return false; }
@@ -675,6 +686,10 @@ bool ReadIndexFromZip(Archive& arc, ZipIndex& idx, std::wstring& err) {
         }
         // The end record says which disk it's on: the last, if no part is missing.
         if (disks.size() == 1 && (disk || cdDisk)) { err = kOnePart; return false; }
+        if (disks.size() > 1 && disk + 1 > disks.size()) {   // the parts before the .zip stop short
+            err = L"\"" + Leaf(PartPath(arc.First(), arc.kind, disks.size() - 1, SIZE_MAX)) + L"\" is missing.";
+            return false;
+        }
         if (disks.size() > 1 && disk + 1 != disks.size()) { err = kPartMissing; return false; }
         if (!OnDisk(disks, cdDisk, off, cdOff)) cdOff = UINT64_MAX;
         break;
@@ -840,6 +855,19 @@ bool WriteLostMarker(const std::wstring& zip, uint64_t offset) {
 bool OpenArchive(const std::wstring& path, bool write, Archive& arc, ZipIndex& idx, bool& resuming, std::wstring& err) {
     std::wstring first;
     SetKind kind = KindOf(path, first);
+    if (kind == SetKind::Single) {   // a later part of a split zip whose first part isn't next to it
+        std::wstring leaf = Lower(Leaf(path)), stem = path.substr(0, path.find_last_of(L'.'));
+        std::wstring ext = leaf.substr(leaf.find_last_of(L'.') + 1), one;
+        if (ext.size() >= 3 && AllDigits(ext) && _wtoi(ext.c_str()) != 1 && Lower(stem).size() > 4 &&
+            Lower(stem).compare(stem.size() - 4, 4, L".zip") == 0)
+            one = stem + L"." + std::wstring(ext.size() - 1, L'0') + L"1";
+        else if (ext.size() >= 3 && ext[0] == L'z' && AllDigits(ext.substr(1)) && ext != L"z01")
+            one = stem + L".z01";
+        if (!one.empty()) {
+            err = L"The first part, \"" + Leaf(one) + L"\", is missing.";
+            return false;
+        }
+    }
     Resume r;
     Sidecar s = ReadSidecar(first, r, idx, err);
     if (s == Sidecar::Bad) return false;
@@ -875,6 +903,7 @@ const wchar_t* MethodProblem(const ZipEntry& e) {
         case 95: return L"XZ compression";
         case 98: return L"PPMd compression";
         case 99: return L"AES encrypted";
+        case 0xFFFE: return L"a link, which ZeroZip doesn't extract";
         default: return L"unknown compression";
     }
 }
@@ -890,12 +919,12 @@ struct Problems {
 
 // Fills in each entry's output path and finds entries that would fail partway
 // through a run, so they block it before anything is touched.
-void MapPaths(ZipIndex& idx, const std::wstring& destFull, const Archive& arc, Problems bad, bool& singleRoot) {
+// `keep` are the archive's own files, which must never be written over.
+void MapPaths(ZipIndex& idx, const std::wstring& destFull, const std::vector<std::wstring>& keep, Problems bad, bool& singleRoot) {
     std::wstring base = Extended(destFull);
     VolumeInfo vol = InfoOf(destFull);
-    std::unordered_set<std::wstring> reserved = {Lower(Extended(SidecarPath(arc.First()))),
-                                                 Lower(Extended(LostMarkerPath(arc.First())))};
-    for (auto& p : arc.parts) reserved.insert(Lower(Extended(p.path)));
+    std::unordered_set<std::wstring> reserved;
+    for (auto& p : keep) reserved.insert(Lower(Extended(p)));
     std::unordered_map<std::wstring, size_t> lastByName;
     for (size_t i = 0; i < idx.entries.size(); i++)
         if (!idx.entries[i].isDir) lastByName[idx.entries[i].name] = i;
@@ -960,12 +989,113 @@ void MapPaths(ZipIndex& idx, const std::wstring& destFull, const Archive& arc, P
         }
 }
 
+// Keeps the chart light: at most ~240 points, each bucket keeping its lowest value.
+std::vector<std::pair<double, int64_t>> Thin(std::vector<std::pair<double, int64_t>> pts) {
+    const size_t kBuckets = 240;
+    if (pts.size() <= kBuckets) return pts;
+    std::vector<std::pair<double, int64_t>> out;
+    size_t per = (pts.size() + kBuckets - 1) / kBuckets;
+    for (size_t i = 0; i < pts.size(); i += per) {
+        auto best = pts[i];
+        for (size_t j = i; j < std::min(pts.size(), i + per); j++)
+            if (pts[j].second < best.second) best = pts[j];
+        best.first = pts[std::min(pts.size(), i + per) - 1].first;
+        out.push_back(best);
+    }
+    out.front().first = 0.0;
+    out.push_back(pts.back());
+    return out;
+}
+
+std::vector<std::wstring> KeepPaths(const Archive& arc) {
+    std::vector<std::wstring> keep = {SidecarPath(arc.First()), LostMarkerPath(arc.First())};
+    for (auto& p : arc.parts) keep.push_back(p.path);
+    return keep;
+}
+
+// ---- RAR names ----------------------------------------------------------------
+
+// The volumes of a RAR set by name: Game.part1.rar, Game.part2.rar, ... (any width),
+// or in the old style Game.rar, Game.r00, ..., Game.r99, Game.s00, ...
+struct RarNames {
+    std::wstring stem;
+    enum class Style { One, Parts, Old } style = Style::One;
+    size_t width = 1;
+
+    std::wstring Volume(size_t i) const {
+        if (style == Style::Parts) {
+            std::wstring n = std::to_wstring(i + 1);
+            if (n.size() < width) n.insert(0, width - n.size(), L'0');
+            return stem + L".part" + n + L".rar";
+        }
+        if (style == Style::One) return i ? std::wstring() : stem;
+        if (i == 0) return stem + L".rar";
+        wchar_t ext[8];
+        swprintf_s(ext, L".%c%02u", wchar_t(L'r' + (i - 1) / 100), unsigned((i - 1) % 100));
+        return stem + ext;
+    }
+
+    std::wstring Sidecar() const { return (style == Style::One ? stem : stem + L".rar") + L".zerozip"; }
+
+    std::wstring Name() const {
+        std::wstring leaf = Leaf(stem);
+        return style == Style::One ? leaf : leaf + L".rar";
+    }
+};
+
+void RarNamesFrom(const std::wstring& path, RarNames& n);
+
+// Whether `path` is a RAR volume, by its first bytes, and how its set is named. A
+// volume a stopped run has already deleted still counts, so that resuming from it works.
+bool RarNamesOf(const std::wstring& path, RarNames& n) {
+    RarNames named;
+    RarNamesFrom(path, named);
+    Handle h(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, 0, nullptr));
+    uint8_t sig[6];
+    if (!h) {
+        if (GetLastError() != ERROR_FILE_NOT_FOUND || named.style == RarNames::Style::One || !Exists(named.Sidecar())) return false;
+    } else if (!ReadAt(h.h, 0, sig, 6) || memcmp(sig, "Rar!\x1a\x07", 6) != 0) {
+        return false;
+    }
+    n = named;
+    return true;
+}
+
+// How the set `path` belongs to is named, from the name alone.
+void RarNamesFrom(const std::wstring& path, RarNames& n) {
+    n = RarNames();
+    n.stem = path;
+    std::wstring low = Lower(Leaf(path));
+    size_t dot = low.find_last_of(L'.');
+    if (dot == std::wstring::npos) return;
+    std::wstring ext = low.substr(dot + 1), base = path.substr(0, path.size() - ext.size() - 1);
+    if (ext == L"rar") {
+        size_t p = Lower(base).rfind(L".part");
+        if (p != std::wstring::npos && AllDigits(base.substr(p + 5))) {
+            n.style = RarNames::Style::Parts;
+            n.width = base.size() - p - 5;
+            n.stem = base.substr(0, p);
+        } else {
+            n.style = RarNames::Style::Old;
+            n.stem = base;
+        }
+    } else if (ext.size() == 3 && (ext[0] == L'r' || ext[0] == L's') && AllDigits(ext.substr(1))) {
+        n.style = RarNames::Style::Old;
+        n.stem = base;
+    }
+}
+// The rest of the RAR side is further down.
+bool AnalyzeRar(const std::wstring& path, const RarNames& n, const std::wstring& destIn, Analysis& a, std::wstring& err);
+
 }  // namespace
 
 std::wstring SidecarPath(const std::wstring& zip) { return zip + L".zerozip"; }
 std::wstring LostMarkerPath(const std::wstring& zip) { return zip + L".zerozip-lost"; }
 
 std::wstring ArchiveName(const std::wstring& path) {
+    RarNames rar;
+    if (RarNamesOf(path, rar)) return rar.Name();
     std::wstring first;
     SetKind kind = KindOf(path, first);
     std::wstring leaf = Leaf(first);
@@ -976,6 +1106,8 @@ std::wstring ArchiveName(const std::wstring& path) {
 
 bool Analyze(const std::wstring& zipIn, const std::wstring& destIn, Analysis& a, std::wstring& err) {
     a = Analysis();
+    RarNames rar;
+    if (RarNamesOf(FullPath(zipIn), rar)) return AnalyzeRar(FullPath(zipIn), rar, destIn, a, err);
     Archive arc;
     ZipIndex idx;
     if (!OpenArchive(FullPath(zipIn), false, arc, idx, a.resuming, err)) return false;
@@ -995,13 +1127,13 @@ bool Analyze(const std::wstring& zipIn, const std::wstring& destIn, Analysis& a,
     } else {
         // Like "smart extract" elsewhere: a zip with one top folder goes next to
         // the zip, anything else into a folder named after it.
-        MapPaths(idx, zipDir, arc, {ignored, ignoredCount}, a.singleRoot);
+        MapPaths(idx, zipDir, KeepPaths(arc), {ignored, ignoredCount}, a.singleRoot);
         std::wstring stem = a.name;
         size_t dot = stem.find_last_of(L'.');
         if (dot != std::wstring::npos && dot > 0) stem.resize(dot);
         a.dest = a.singleRoot ? zipDir : FullPath(zipDir + L"\\" + stem);
     }
-    MapPaths(idx, a.dest, arc, {a.problems, a.problemCount}, a.singleRoot);
+    MapPaths(idx, a.dest, KeepPaths(arc), {a.problems, a.problemCount}, a.singleRoot);
 
     a.volume = VolumeOf(ExistingAncestor(a.dest));
     a.sameVolume = SameVolume(a.zip, a.dest);
@@ -1063,24 +1195,7 @@ bool Analyze(const std::wstring& zipIn, const std::wstring& destIn, Analysis& a,
     a.minFree = worst;
     a.endFree = f;
 
-    // Keep the chart light: at most ~240 points, each bucket keeping its lowest value.
-    const size_t kBuckets = 240;
-    if (pts.size() <= kBuckets) {
-        a.curve = std::move(pts);
-    } else {
-        std::vector<std::pair<double, int64_t>> out;
-        size_t per = (pts.size() + kBuckets - 1) / kBuckets;
-        for (size_t i = 0; i < pts.size(); i += per) {
-            auto best = pts[i];
-            for (size_t j = i; j < std::min(pts.size(), i + per); j++)
-                if (pts[j].second < best.second) best = pts[j];
-            best.first = pts[std::min(pts.size(), i + per) - 1].first;
-            out.push_back(best);
-        }
-        out.front().first = 0.0;
-        out.push_back(pts.back());
-        a.curve = std::move(out);
-    }
+    a.curve = Thin(std::move(pts));
     return true;
 }
 
@@ -1120,7 +1235,7 @@ bool Extractor::WaitIfPaused() {
 namespace {
 
 struct Job {
-    Archive& arc;
+    Archive* zipArc;                   // a zip's parts; null for a RAR
     std::wstring zipPath, dest;
     uint64_t freeCheckedAt = 0;
     uint64_t punchUnit = 64 << 10;     // freed ranges of a sparse file are rounded to this
@@ -1131,7 +1246,7 @@ struct Job {
     Extractor::ProgressFn onProgress;
     std::function<bool()> keepGoing;
 
-    Job(Archive& a, std::wstring d) : arc(a), zipPath(a.First()), dest(std::move(d)) {}
+    Job(Archive* a, std::wstring markerBase, std::wstring d) : zipArc(a), zipPath(std::move(markerBase)), dest(std::move(d)) {}
     ~Job() { if (zstd) ZSTD_freeDCtx(zstd); }
 
     void Tick(uint64_t bytes) {
@@ -1179,6 +1294,7 @@ struct Job {
     // With `punch`, the entry's zip data is freed as it is used, for files too big
     // for the free space.
     bool Extract(const ZipEntry& e, bool punch, std::wstring& err) {
+        Archive& arc = *zipArc;
         if (e.data + e.csize > arc.size) { err = L"The zip is damaged near \"" + e.name + L"\"."; return false; }
         if (punch) {
             if (!arc.MakeSparse(e.data, e.data + e.csize)) {
@@ -1338,17 +1454,607 @@ struct Job {
     }
 
     bool Truncate(uint64_t at, std::wstring& err) {
-        if (!arc.Cut(at, err)) return false;
-        prog.zipBytes = arc.size;
+        if (!zipArc->Cut(at, err)) return false;
+        prog.zipBytes = zipArc->size;
         return true;
     }
 };
+
+// ---- RAR ----------------------------------------------------------------------
+//
+// RAR archives are read with the UnRAR source in third_party/unrar, whose license
+// asks for this paragraph:
+//   UnRAR source code may be used in any software to handle RAR archives without
+//   limitations free of charge, but cannot be used to develop RAR (WinRAR) compatible
+//   archiver and to re-create RAR compression algorithm, which is proprietary.
+//   Distribution of modified UnRAR source code in separate form or as a part of other
+//   software is permitted, provided that full text of this paragraph, starting from
+//   "UnRAR source code" words, is included in license, or in documentation if license
+//   is not available, and in source code comments of resulting package.
+//
+// A RAR is read front to back, so its space comes back a volume at a time: a volume
+// is deleted once every file with data in it is written, checked and flushed, which
+// is when the next file starts in a later volume. A RAR in one volume goes only at
+// the end, so its files have to fit next to it.
+//
+// A non-solid RAR resumes from the first volume still there, skipping the end of a
+// file that started in a volume already gone (that file was finished before its
+// volume went). A solid RAR can only be decoded from its start, so once its first
+// volume is gone it can't be resumed. So a solid RAR's volumes are only deleted when
+// the next file wouldn't fit otherwise, and once one is gone a stop is ignored.
+
+struct RarCallbacks {
+    std::wstring missing;          // a volume UnRAR asked for that isn't there
+    bool password = false, bigDict = false;
+    std::function<bool(const uint8_t*, size_t)> data;
+};
+
+int CALLBACK OnRar(UINT msg, LPARAM user, LPARAM p1, LPARAM p2) {
+    auto* c = reinterpret_cast<RarCallbacks*>(user);
+    switch (msg) {
+        case UCM_CHANGEVOLUMEW:
+            if (p2 == RAR_VOL_ASK) {
+                c->missing = reinterpret_cast<const wchar_t*>(p1);
+                return -1;
+            }
+            return 1;
+        case UCM_CHANGEVOLUME: return p2 == RAR_VOL_ASK ? -1 : 1;
+        case UCM_PROCESSDATA: return c->data && c->data(reinterpret_cast<const uint8_t*>(p1), size_t(p2)) ? 1 : -1;
+        case UCM_NEEDPASSWORD:
+        case UCM_NEEDPASSWORDW: c->password = true; return -1;
+        case UCM_LARGEDICT: c->bigDict = true; return 0;   // a dictionary over 4 GB of memory: no
+    }
+    return 0;
+}
+
+std::wstring RarError(int code, const RarCallbacks& c) {
+    if (!c.missing.empty()) return L"\"" + Leaf(c.missing) + L"\" is missing. Put all of the RAR's parts in the same folder.";
+    if (c.password || code == ERAR_MISSING_PASSWORD || code == ERAR_BAD_PASSWORD)
+        return L"This RAR is password protected, which ZeroZip doesn't support yet.";
+    if (c.bigDict || code == ERAR_LARGE_DICT) return L"This RAR needs more than 4 GB of memory to extract, which ZeroZip doesn't allow.";
+    switch (code) {
+        case ERAR_NO_MEMORY: return L"Out of memory.";
+        case ERAR_BAD_DATA: return L"The RAR is damaged: its data failed its check.";
+        case ERAR_BAD_ARCHIVE:
+        case ERAR_UNKNOWN_FORMAT: return L"This RAR is damaged, or not a RAR file.";
+        case ERAR_EOPEN: return L"Couldn't open the RAR. If WinRAR or another app has it open, close it and try again.";
+        case ERAR_EREAD: return L"Couldn't read the RAR.";
+        default: return L"Couldn't read the RAR (error " + std::to_wstring(code) + L").";
+    }
+}
+
+HANDLE OpenRar(const std::wstring& volume, unsigned mode, RarCallbacks& c, unsigned& flags, std::wstring& err) {
+    std::wstring name = volume;
+    RAROpenArchiveDataEx d{};
+    d.ArcNameW = name.data();
+    d.OpenMode = mode;
+    d.Callback = OnRar;
+    d.UserData = LPARAM(&c);
+    HANDLE h = RAROpenArchiveEx(&d);
+    if (!h || d.OpenResult) {
+        if (h) RARCloseArchive(h);
+        err = RarError(int(d.OpenResult), c);
+        return nullptr;
+    }
+    flags = d.Flags;
+    return h;
+}
+
+// UnRAR keeps its error state in globals, so only one thread uses it at a time.
+std::mutex g_unrar;
+
+// Where the set stands: every volume's size, which are already gone, and its files.
+// `idx` holds every file in the RAR; the first `skip` were done by an earlier run whose
+// volumes are gone, and are only there so that names map to the same paths as then.
+struct RarState {
+    std::vector<uint64_t> sizes;   // every volume, at its full size
+    size_t from = 0;               // the first volume still there
+    size_t skip = 0;
+    bool solid = false, resuming = false;
+    std::wstring dest;             // from the sidecar
+    ZipIndex idx;
+
+    uint64_t Left() const {
+        uint64_t n = 0;
+        for (size_t i = from; i < sizes.size(); i++) n += sizes[i];
+        return n;
+    }
+};
+
+// The sidecar, next to the volumes. Volumes are only ever deleted whole, from the
+// first, so the ones left must be a run of untouched volumes ending with the last.
+// It also lists every file in the RAR, so a resume maps names the way the first run did.
+//   magic[8] solid:u32 volumes:u32 destLen:u32 files:u32 size[volumes]:u64 dest[destLen]
+//   then per file: dir:u8 nameLen:u32 name[nameLen]
+constexpr char kRarMagic[8] = {'Z', 'Z', 'R', 'A', 'R', '0', '0', '2'};
+
+Sidecar ReadRarSidecar(const RarNames& n, RarState& st, std::wstring& err) {
+    Handle h(CreateFileW(n.Sidecar().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
+    if (!h) {
+        DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return Sidecar::None;
+        err = L"Couldn't read the resume file next to the RAR: " + ErrText(code);
+        return Sidecar::Bad;
+    }
+    uint64_t size = FileSize(h.h);
+    uint8_t head[24];
+    if (size < 24 || size > (1u << 28) || !ReadAt(h.h, 0, head, 24) || memcmp(head, kRarMagic, 8) != 0) return Sidecar::Stale;
+    uint32_t count = rd32(head + 12), destLen = rd32(head + 16), files = rd32(head + 20);
+    std::vector<uint8_t> b(size_t(size - 24));
+    if (!count || 24 + uint64_t(count) * 8 + uint64_t(destLen) * 2 > size || !ReadAt(h.h, 24, b.data(), b.size()))
+        return Sidecar::Stale;
+    st.solid = rd32(head + 8) != 0;
+    st.sizes.clear();
+    for (uint32_t i = 0; i < count; i++) st.sizes.push_back(rd64(b.data() + 8 * i));
+    size_t at = size_t(count) * 8;
+    st.dest.assign(reinterpret_cast<const wchar_t*>(b.data() + at), destLen);
+    at += size_t(destLen) * 2;
+    st.idx = ZipIndex();
+    for (uint32_t i = 0; i < files; i++) {
+        if (at + 5 > b.size()) return Sidecar::Stale;
+        ZipEntry e;
+        e.isDir = b[at] != 0;
+        uint32_t len = rd32(b.data() + at + 1);
+        at += 5;
+        if (at + uint64_t(len) * 2 > b.size()) return Sidecar::Stale;
+        e.name.assign(reinterpret_cast<const wchar_t*>(b.data() + at), len);
+        e.offset = i;
+        at += size_t(len) * 2;
+        st.idx.entries.push_back(std::move(e));
+    }
+    st.from = count;
+    for (size_t i = 0; i < count; i++) {
+        uint64_t have = 0;
+        bool there = SizeOnDisk(n.Volume(i), have);
+        if (there && have != st.sizes[i]) return Sidecar::Stale;   // a different download under the same name
+        if (there && st.from == count) st.from = i;
+        if (!there && st.from != count) return Sidecar::Stale;    // a gap after the first volume still there
+    }
+    return st.from < count ? Sidecar::Ok : Sidecar::Stale;
+}
+
+bool WriteRarSidecar(const RarNames& n, const RarState& st, const std::wstring& dest, std::wstring& err) {
+    std::wstring path = n.Sidecar(), tmp = path + L".tmp";
+    uint8_t head[24] = {};
+    uint32_t solid = st.solid, count = uint32_t(st.sizes.size()), destLen = uint32_t(dest.size()),
+             files = uint32_t(st.idx.entries.size());
+    memcpy(head, kRarMagic, 8);
+    memcpy(head + 8, &solid, 4);
+    memcpy(head + 12, &count, 4);
+    memcpy(head + 16, &destLen, 4);
+    memcpy(head + 20, &files, 4);
+    std::vector<uint8_t> list;
+    for (auto& e : st.idx.entries) {
+        uint32_t len = uint32_t(e.name.size());
+        list.push_back(e.isDir ? 1 : 0);
+        list.insert(list.end(), reinterpret_cast<const uint8_t*>(&len), reinterpret_cast<const uint8_t*>(&len) + 4);
+        list.insert(list.end(), reinterpret_cast<const uint8_t*>(e.name.data()),
+                    reinterpret_cast<const uint8_t*>(e.name.data()) + e.name.size() * 2);
+    }
+    {
+        Handle h(CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr));
+        if (!h || !WriteAll(h.h, head, 24) || !WriteAll(h.h, st.sizes.data(), st.sizes.size() * 8) ||
+            !WriteAll(h.h, dest.data(), dest.size() * 2) || !WriteAll(h.h, list.data(), list.size()) || !FlushFileBuffers(h.h)) {
+            err = L"Couldn't save resume data next to the RAR: " + ErrText(GetLastError());
+            return false;
+        }
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        err = L"Couldn't save resume data next to the RAR: " + ErrText(GetLastError());
+        return false;
+    }
+    FlushDir(ParentOf(path));
+    return true;
+}
+
+// The volume a header is in, by name. A name that isn't one of the set's means the
+// volumes are named some other way, which ZeroZip can't follow safely.
+size_t VolumeIndex(const std::vector<std::wstring>& names, const wchar_t* arcName, std::wstring& err) {
+    size_t v = size_t(std::find(names.begin(), names.end(), Lower(Leaf(arcName))) - names.begin());
+    if (v == names.size()) err = L"\"" + Leaf(arcName) + L"\" isn't named like the rest of this RAR's parts.";
+    return v;
+}
+
+// Reads every file's header from the first volume still there, noting the volume each
+// file starts in. On a fresh run it also finds which volumes really are part of the set.
+bool ListRar(const RarNames& n, RarState& st, std::wstring& err) {
+    RarCallbacks c;
+    unsigned flags = 0;
+    HANDLE h = OpenRar(n.Volume(st.from), RAR_OM_LIST_INCSPLIT, c, flags, err);
+    if (!h) return false;
+    if (!st.resuming) {
+        st.solid = (flags & ROADF_SOLID) != 0;
+        if (!(flags & ROADF_VOLUME)) {
+            st.sizes.resize(1);   // one RAR, whatever else is named like its parts
+        } else if (!(flags & ROADF_FIRSTVOLUME)) {
+            RARCloseArchive(h);
+            err = L"This is one part of a RAR in parts, and its first part isn't next to it.";
+            return false;
+        }
+    }
+    std::vector<std::wstring> names;
+    for (size_t i = 0; i < st.sizes.size(); i++) names.push_back(Lower(Leaf(n.Volume(i))));
+    std::vector<wchar_t> name(32768), arc(32768);
+    std::vector<ZipEntry> found;
+    size_t lastVol = st.from;
+    int r = 0;
+    for (uint64_t order = 0;;) {
+        RARHeaderDataEx hd{};
+        hd.FileNameEx = name.data();
+        hd.FileNameExSize = unsigned(name.size());
+        hd.ArcNameEx = arc.data();
+        hd.ArcNameExSize = unsigned(arc.size());
+        if ((r = RARReadHeaderEx(h, &hd)) != 0) break;
+        size_t vol = VolumeIndex(names, arc.data(), err);
+        if (vol == names.size()) {
+            RARCloseArchive(h);
+            return false;
+        }
+        lastVol = std::max(lastVol, vol);
+        // A file split over volumes has its checksum in its last piece.
+        bool last = !(hd.Flags & RHDF_SPLITAFTER);
+        if ((hd.Flags & RHDF_SPLITBEFORE) && last && order) {
+            found.back().crc = hd.FileCRC;
+            found.back().crcKnown = hd.HashType == RAR_HASH_CRC32;
+        }
+        if (!(hd.Flags & RHDF_SPLITBEFORE)) {   // the rest of a file is only more of its data
+            ZipEntry e;
+            e.name = name.data();
+            e.offset = order++;
+            e.size = uint64_t(hd.UnpSizeHigh) << 32 | hd.UnpSize;
+            e.csize = uint64_t(hd.PackSizeHigh) << 32 | hd.PackSize;
+            e.crc = hd.FileCRC;
+            e.crcKnown = last && hd.HashType == RAR_HASH_CRC32;
+            e.attrs = hd.FileAttr;
+            e.madeBy = hd.HostOS == 2 ? 10 << 8 : 3 << 8;   // Windows attributes, or Unix ones
+            e.dosTime = uint16_t(hd.FileTime);
+            e.dosDate = uint16_t(hd.FileTime >> 16);
+            e.isDir = (hd.Flags & RHDF_DIRECTORY) != 0;
+            e.flags = (hd.Flags & RHDF_ENCRYPTED) ? 1 : 0;
+            if (hd.RedirType) e.method = 0xFFFE;
+            e.vol = uint32_t(vol);
+            found.push_back(std::move(e));
+        }
+        if ((r = RARProcessFile(h, RAR_SKIP, nullptr, nullptr)) != 0) break;
+    }
+    RARCloseArchive(h);
+    if (r != ERAR_END_ARCHIVE) {
+        err = RarError(r, c);
+        return false;
+    }
+    if (!st.resuming) {
+        // Only the volumes UnRAR read: a file named like a later part isn't part of the set.
+        st.sizes.resize(lastVol + 1);
+        st.idx = ZipIndex();
+        st.idx.entries = std::move(found);
+        st.skip = 0;
+        return true;
+    }
+    // Resuming: what's left must be the end of the list the first run saved.
+    if (found.size() > st.idx.entries.size()) {
+        err = L"The RAR has changed since ZeroZip last worked on it, so it can't be resumed safely.";
+        return false;
+    }
+    st.skip = st.idx.entries.size() - found.size();
+    for (size_t i = 0; i < found.size(); i++) {
+        if (found[i].name != st.idx.entries[st.skip + i].name) {
+            err = L"The RAR has changed since ZeroZip last worked on it, so it can't be resumed safely.";
+            return false;
+        }
+        found[i].offset = st.skip + i;
+        st.idx.entries[st.skip + i] = std::move(found[i]);
+    }
+    return true;
+}
+
+// Finds the set's volumes and its files: from the sidecar when resuming, otherwise
+// by name from the first volume.
+bool LoadRar(const RarNames& n, RarState& st, std::wstring& err) {
+    Sidecar s = ReadRarSidecar(n, st, err);
+    if (s == Sidecar::Bad) return false;
+    st.resuming = s == Sidecar::Ok;
+    if (!st.resuming) {
+        st = RarState();
+        for (size_t i = 0;; i++) {
+            std::wstring v = n.Volume(i);
+            uint64_t have = 0;
+            if (v.empty() || !SizeOnDisk(v, have)) break;
+            st.sizes.push_back(have);
+        }
+        if (st.sizes.empty()) {
+            err = L"The first part, \"" + Leaf(n.Volume(0)) + L"\", is missing.";
+            return false;
+        }
+    }
+    if (!ListRar(n, st, err)) return false;
+    if (st.resuming && st.solid && st.from > 0) {
+        err = L"This solid RAR was stopped partway, and its first parts are already gone. A solid RAR can only be read from its "
+              L"start, so it can't be resumed.";
+        return false;
+    }
+    return true;
+}
+
+std::vector<std::wstring> RarKeep(const RarNames& n, const RarState& st) {
+    std::vector<std::wstring> keep = {n.Sidecar(), n.Sidecar() + L".tmp"};
+    for (size_t i = 0; i < st.sizes.size(); i++) keep.push_back(n.Volume(i));
+    return keep;
+}
+
+bool AnalyzeRar(const std::wstring& path, const RarNames& n, const std::wstring& destIn, Analysis& a, std::wstring& err) {
+    (void)path;
+    RarState st;
+    {
+        std::lock_guard<std::mutex> lock(g_unrar);
+        if (!LoadRar(n, st, err)) return false;
+    }
+    a.rar = true;
+    a.solid = st.solid;
+    a.resuming = st.resuming;
+    a.zip = n.Volume(st.from);
+    a.name = n.Name();
+    a.parts = st.sizes.size();
+    a.zipBytes = st.Left();
+    std::wstring dir = ParentOf(a.zip);
+    std::vector<Problem> ignored;
+    size_t ignoredCount = 0;
+    if (!destIn.empty()) {
+        a.dest = FullPath(destIn);
+    } else if (st.resuming && !st.dest.empty()) {
+        a.dest = st.dest;
+    } else {
+        MapPaths(st.idx, dir, RarKeep(n, st), {ignored, ignoredCount}, a.singleRoot);
+        std::wstring stem = a.name;
+        size_t dot = stem.find_last_of(L'.');
+        if (dot != std::wstring::npos && dot > 0) stem.resize(dot);
+        a.dest = a.singleRoot ? dir : FullPath(dir + L"\\" + stem);
+    }
+    MapPaths(st.idx, a.dest, RarKeep(n, st), {a.problems, a.problemCount}, a.singleRoot);
+
+    a.volume = VolumeOf(ExistingAncestor(a.dest));
+    a.sameVolume = SameVolume(a.zip, a.dest);
+    VolumeInfo vol = InfoOf(a.dest);
+    a.freeBytes = FreeOn(a.dest);
+    a.margin = kMargin;
+    auto onDisk = [&](uint64_t b) { return (b + vol.cluster - 1) / vol.cluster * vol.cluster; };
+
+    // The same plan as for a zip, but volumes go from the front as files start in later ones.
+    int64_t f = int64_t(a.freeBytes);
+    if (!st.resuming && a.sameVolume) f -= int64_t(onDisk(24 + st.sizes.size() * 8 + a.dest.size() * 2));
+    int64_t worst = f;
+    uint64_t total = 0, done = 0;
+    for (size_t i = st.skip; i < st.idx.entries.size(); i++) total += st.idx.entries[i].isDir ? 0 : st.idx.entries[i].size;
+    std::vector<std::pair<double, int64_t>> pts{{0.0, f}};
+    size_t gone = st.from;
+    for (size_t i = st.skip; i < st.idx.entries.size(); i++) {
+        const ZipEntry& e = st.idx.entries[i];
+        for (; gone < e.vol && gone < st.sizes.size(); gone++)
+            if (a.sameVolume) f += int64_t(st.sizes[gone]);
+        if (e.isDir) {
+            a.dirs++;
+            continue;
+        }
+        if (e.path.empty()) continue;
+        a.files++;
+        a.unpacked += e.size;
+        uint64_t have = 0;
+        bool exists = SizeOnDisk(e.path, have);
+        if (exists && have == e.size) {
+            a.present++;
+        } else {
+            if (exists) f += int64_t(onDisk(have));
+            int64_t need = int64_t(onDisk(e.size));
+            f -= need;
+            a.toWrite += e.size;
+            a.normalNeed += uint64_t(need);
+            worst = std::min(worst, f);
+        }
+        done += e.size;
+        pts.push_back({total ? double(done) / double(total) : 1.0, f});
+    }
+    for (; gone < st.sizes.size(); gone++)
+        if (a.sameVolume) f += int64_t(st.sizes[gone]);
+    // A solid RAR only deletes a volume when the space is needed (see RunRar), so it
+    // stays resumable when everything fits next to it.
+    a.solidRisk = st.solid && st.sizes.size() > 1 && int64_t(a.freeBytes) - int64_t(a.normalNeed) < int64_t(kMargin);
+    pts.push_back({1.0, f});
+    a.minFree = worst;
+    a.endFree = f;
+    a.curve = Thin(std::move(pts));
+    return true;
+}
+
+bool RunRar(Extractor& ex, const RarNames& n, const std::wstring& path, const std::wstring& destIn,
+            Extractor::ProgressFn onProgress, Extractor::LogFn onFile, std::wstring& err) {
+    (void)path;
+    std::lock_guard<std::mutex> lock(g_unrar);
+    RarState st;
+    if (!LoadRar(n, st, err)) return false;
+    std::wstring dest = FullPath(destIn);
+    std::vector<Problem> bad;
+    size_t badCount = 0;
+    bool singleRoot;
+    MapPaths(st.idx, dest, RarKeep(n, st), {bad, badCount}, singleRoot);
+    if (badCount) {
+        err = L"\"" + bad[0].name + L"\" can't be extracted: " + bad[0].reason + L".";
+        return false;
+    }
+    if (ExistingAncestor(dest) != dest && !MakeDirs(Extended(dest))) {
+        err = L"Couldn't create the destination folder: " + ErrText(GetLastError());
+        return false;
+    }
+    if (!st.resuming && !WriteRarSidecar(n, st, dest, err)) return false;
+    bool sameVolume = SameVolume(n.Volume(st.from), dest);
+
+    Job r(nullptr, n.Sidecar(), dest);
+    r.onProgress = std::move(onProgress);
+    // Past the start of a solid RAR, stopping would lose what's left, so it carries on.
+    auto alive = [&] { return ex.WaitIfPaused() || r.prog.unstoppable; };
+    r.keepGoing = alive;
+    for (size_t i = st.skip; i < st.idx.entries.size(); i++) {
+        r.prog.total++;
+        if (!st.idx.entries[i].isDir && !st.idx.entries[i].path.empty()) r.prog.bytesTotal += st.idx.entries[i].size;
+    }
+    r.prog.zipBytes = st.Left();
+    r.prog.freeBytes = FreeOn(dest);
+    r.onProgress(r.prog);
+
+    RarCallbacks c;
+    unsigned flags = 0;
+    HANDLE h = OpenRar(n.Volume(st.from), RAR_OM_EXTRACT, c, flags, err);
+    if (!h) return false;
+    struct Closer {
+        HANDLE& h;
+        ~Closer() { if (h) RARCloseArchive(h); }
+    } closer{h};
+
+    std::vector<std::wstring> names;
+    for (size_t i = 0; i < st.sizes.size(); i++) names.push_back(Lower(Leaf(n.Volume(i))));
+    size_t gone = st.from;
+    // Deletes the volumes before `v`: every file with data in them is done.
+    auto dropBefore = [&](size_t v) {
+        bool any = false;
+        for (; gone < v && gone < st.sizes.size(); gone++) {
+            if (!RemoveFile(n.Volume(gone))) {
+                err = L"Couldn't delete \"" + Leaf(n.Volume(gone)) + L"\": " + ErrText(GetLastError());
+                return false;
+            }
+            r.prog.zipBytes -= std::min(r.prog.zipBytes, st.sizes[gone]);
+            any = true;
+        }
+        if (any) FlushDir(ParentOf(n.Volume(0)));
+        if (st.solid && gone > 0) r.prog.unstoppable = true;
+        return true;
+    };
+
+    std::vector<wchar_t> name(32768), arc(32768);
+    size_t k = st.skip;
+    for (;;) {
+        RARHeaderDataEx hd{};
+        hd.FileNameEx = name.data();
+        hd.FileNameExSize = unsigned(name.size());
+        hd.ArcNameEx = arc.data();
+        hd.ArcNameExSize = unsigned(arc.size());
+        int rc = RARReadHeaderEx(h, &hd);
+        if (rc == ERAR_END_ARCHIVE) break;
+        if (rc) { err = RarError(rc, c); return false; }
+        if (hd.Flags & RHDF_SPLITBEFORE) {   // the end of a file finished before its first volume went
+            if ((rc = RARProcessFile(h, RAR_SKIP, nullptr, nullptr)) != 0) { err = RarError(rc, c); return false; }
+            continue;
+        }
+        if (k >= st.idx.entries.size() || st.idx.entries[k].name != name.data()) {
+            err = L"The RAR has changed since ZeroZip read it. Open it again.";
+            return false;
+        }
+        const ZipEntry& e = st.idx.entries[k++];
+        size_t vol = VolumeIndex(names, arc.data(), err);
+        if (vol == names.size()) return false;
+        if (!alive()) return false;   // a stop asked for before any volume goes is still a clean stop
+        if (!st.solid && !dropBefore(vol)) return false;
+        r.prog.current = e.name;
+        bool extract = false;
+        if (e.isDir) {
+            if (!MakeDirs(e.path)) { err = L"Couldn't create folder \"" + e.name + L"\": " + ErrText(GetLastError()); return false; }
+        } else if (!e.shadowed && !e.path.empty()) {
+            if (!MakeDirs(ParentOf(e.path))) { err = L"Couldn't create folder for \"" + e.name + L"\": " + ErrText(GetLastError()); return false; }
+            DeleteFileW((e.path + kTemp).c_str());
+            auto check = e.crcKnown ? r.Matches(e.path, e) : Job::Check::Missing;
+            if (check == Job::Check::Stopped) return false;
+            if (check == Job::Check::Ok) {
+                onFile(e.name, e.size, FileResult::Verified);
+            } else {
+                uint64_t need = e.size + kMargin, have = 0, freed = 0;
+                bool there = SizeOnDisk(e.path, have);
+                uint64_t free = FreeOn(dest) + (there ? have : 0);
+                // A solid RAR gives up its volumes only when the space is needed, and only
+                // if giving them up is enough; otherwise it stops while it still can resume.
+                if (st.solid && free < need) {
+                    for (size_t v = gone; v < vol && v < st.sizes.size(); v++) freed += st.sizes[v];
+                    if (!sameVolume || free + freed < need) {
+                        err = L"Not enough free space for \"" + e.name + L"\". Free up a little space, then open the RAR again.";
+                        return false;
+                    }
+                    if (!dropBefore(vol)) return false;
+                }
+                if (there && !RemoveFile(e.path)) {
+                    err = L"Couldn't replace \"" + e.name + L"\": " + ErrText(GetLastError());
+                    return false;
+                }
+                if (FreeOn(dest) < need) {
+                    err = L"Not enough free space for \"" + e.name + L"\". Free up a little space, then open the RAR again.";
+                    return false;
+                }
+                extract = true;
+            }
+        }
+        if (!extract) {
+            if ((rc = RARProcessFile(h, RAR_SKIP, nullptr, nullptr)) != 0) { err = RarError(rc, c); return false; }
+        } else {
+            std::wstring tmp = e.path + kTemp;
+            Handle file(CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+            if (!file) { err = L"Couldn't create \"" + e.name + L"\": " + ErrText(GetLastError()); return false; }
+            FILE_ALLOCATION_INFO alloc{};
+            alloc.AllocationSize.QuadPart = LONGLONG(e.size);
+            SetFileInformationByHandle(file.h, FileAllocationInfo, &alloc, sizeof alloc);
+            uint64_t written = 0;
+            bool stopped = false;
+            std::wstring why;
+            c.data = [&](const uint8_t* p, size_t len) {
+                if (!alive()) { stopped = true; return false; }
+                // Past the file's own data come its NTFS streams, if it has any; they aren't kept.
+                if (written == e.size) return true;
+                if (written + len > e.size) { why = L"it holds more data than the RAR says"; return false; }
+                if (!WriteAll(file.h, p, len)) {
+                    DWORD code = GetLastError();
+                    why = code == ERROR_DISK_FULL ? L"the drive is full" : L"couldn't write it: " + ErrText(code);
+                    return false;
+                }
+                written += len;
+                r.Tick(len);
+                return true;
+            };
+            uint64_t before = r.prog.bytesDone;
+            rc = RARProcessFileW(h, RAR_TEST, nullptr, nullptr);
+            c.data = nullptr;
+            if (rc || stopped || written != e.size) {
+                file.Close();
+                DeleteFileW(tmp.c_str());
+                r.prog.bytesDone = before;
+                if (stopped) return false;
+                if (why.empty()) why = rc == ERAR_BAD_DATA ? L"it failed its check, so the RAR may be damaged" : RarError(rc, c);
+                err = L"\"" + e.name + L"\": " + why + L". Nothing was removed for this file.";
+                return false;
+            }
+            if (!FlushFileBuffers(file.h)) { err = L"Couldn't save \"" + e.name + L"\": " + ErrText(GetLastError()); return false; }
+            FILETIME ft{hd.MtimeLow, hd.MtimeHigh};
+            if (ft.dwLowDateTime || ft.dwHighDateTime) SetFileTime(file.h, &ft, nullptr, &ft);
+            file.Close();
+            if (!r.Place(e, tmp, err)) return false;
+            onFile(e.name, e.size, FileResult::Written);
+        }
+        r.prog.done++;
+        r.prog.freeBytes = FreeOn(dest);
+        r.onProgress(r.prog);
+    }
+    RARCloseArchive(h);
+    h = nullptr;
+    if (k != st.idx.entries.size()) {
+        err = L"The RAR ended sooner than its list of files said. It may be damaged or still downloading.";
+        return false;
+    }
+    if (!dropBefore(st.sizes.size())) return false;
+    DeleteFileW(n.Sidecar().c_str());
+    return true;
+}
 
 }  // namespace
 
 bool Extractor::Run(const std::wstring& zipIn, const std::wstring& destIn, ProgressFn onProgress, LogFn onFile,
                     std::wstring& err) {
     err.clear();
+    RarNames rar;
+    if (RarNamesOf(FullPath(zipIn), rar)) return RunRar(*this, rar, FullPath(zipIn), destIn, std::move(onProgress), std::move(onFile), err);
     std::wstring dest = FullPath(destIn);
     Archive arc;
     ZipIndex idx;
@@ -1358,7 +2064,7 @@ bool Extractor::Run(const std::wstring& zipIn, const std::wstring& destIn, Progr
     std::vector<Problem> bad;
     size_t badCount = 0;
     bool singleRoot;
-    MapPaths(idx, dest, arc, {bad, badCount}, singleRoot);
+    MapPaths(idx, dest, KeepPaths(arc), {bad, badCount}, singleRoot);
     if (badCount) {
         err = L"\"" + bad[0].name + L"\" can't be extracted: " + bad[0].reason + L".";
         return false;
@@ -1368,7 +2074,7 @@ bool Extractor::Run(const std::wstring& zipIn, const std::wstring& destIn, Progr
         return false;
     }
 
-    Job r(arc, dest);
+    Job r(&arc, zip, dest);
     if (resuming) {
         ReadLostMarker(zip, r.markerAt);
     } else {

@@ -25,6 +25,8 @@ struct ZipEntry {
     uint16_t madeBy = 0;
     bool isDir = false;
     bool shadowed = false;  // an entry with the same name comes later in the zip, and wins
+    bool crcKnown = true;   // a RAR can keep a BLAKE2 hash instead, which isn't checked here
+    uint32_t vol = 0;       // RAR: the volume the file starts in
 };
 
 struct ZipIndex {
@@ -42,7 +44,10 @@ struct Problem {
 struct Analysis {
     std::wstring zip, dest;       // `zip` is the first part of a split zip
     std::wstring name;            // what to call it: "Game.zip" for Game.zip.001 or Game.z01
-    size_t parts = 1;             // a split zip's parts, including any already used up
+    size_t parts = 1;             // a split zip's parts or a RAR's volumes, including any already used up
+    bool rar = false;
+    bool solid = false;           // a solid RAR: once its first volumes are gone, it can't be resumed
+    bool solidRisk = false;       // ... and it will have to delete some before it's done
     uint64_t zipBytes = 0;        // current size on disk
     uint64_t unpacked = 0;        // total of all files
     uint64_t toWrite = 0;         // bytes that still have to be written
@@ -75,6 +80,7 @@ struct Progress {
     std::wstring current;
     bool verifying = false;
     bool punching = false;
+    bool unstoppable = false;                 // a solid RAR's first volume is gone: stopping now loses the rest
 };
 
 enum class FileResult { Written, Verified, Lost };
