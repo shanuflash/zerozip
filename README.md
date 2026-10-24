@@ -1,6 +1,6 @@
 # ZeroZip
 
-Extract huge zip files on a nearly full drive.
+Extract huge zip and RAR files on a nearly full drive.
 
 A normal unzip needs free space for everything inside the zip, while the zip itself still sits on the drive. A 100 GB game zip needs roughly another 115 GB free. ZeroZip gives the zip's space back while it extracts, so it needs only about the difference between the unpacked size and the zip, plus room for one file.
 
@@ -80,7 +80,7 @@ FAT32 and exFAT drives can't free part of a file, so there the biggest file has 
 
 **The zip is consumed.** When ZeroZip finishes, the zip is gone. Keep a copy elsewhere if you need it.
 
-## Supported zips
+## Supported archives
 
 | | |
 |---|---|
@@ -89,12 +89,21 @@ FAT32 and exFAT drives can't free part of a file, so there the biggest file has 
 | Parts | split (`.zip.001`, …) and spanned (`.z01`, …, `.zip`) |
 | Names | UTF-8, legacy code-page names, Info-ZIP Unicode path extra |
 | Not supported | Deflate64, BZip2, LZMA, XZ, PPMd, encrypted zips, self-extractors |
+| RAR | RAR 4 and 5, in one file or in parts, solid or not; not password protected |
 
-Only zip for now. RAR could be extracted in place too: front to back with hole punching, or for non-solid archives back to front like zips. But that needs the official unrar decoder and is not done yet.
+## RAR
+
+RAR archives are read with the official UnRAR code, front to back, so their space comes back a volume at a time:
+
+- **In parts** (`Game.part01.rar`, … or the old `Game.rar`, `Game.r00`, …): each volume is deleted once every file with data in it is written, checked and flushed. Free space dips by about one volume, plus the file being written. Any volume opens the set, and a stopped run resumes from the first volume left.
+- **In one file**: it's only deleted at the end, so its files have to fit next to it. The plan shows whether they do.
+- **Solid** RARs can only be read from their start. ZeroZip keeps their volumes until the space is actually needed, so with room to spare a solid RAR stops and resumes like any other. When it has to delete one, it says so before starting, and from then on it can be paused but not stopped.
+
+Password-protected RARs and links inside a RAR aren't supported yet, and are refused before anything is touched. NTFS streams stored in a RAR aren't kept.
 
 ## Requirements
 
-Windows 10 or 11 (x64). Nothing to install: ZeroZip is one small exe.
+Windows 10 or 11 (x64). Nothing to install: ZeroZip is one exe of about 1 MB.
 
 The window is drawn natively with Direct2D and DirectWrite, in ZeroZip's own dark look with the Geist fonts built in. It looks the same on Windows 10 and 11.
 
@@ -129,11 +138,11 @@ Test switches, read from the environment:
 ## Layout
 
 ```
-src/engine.*      zip index, space planning, extract + truncate / hole punching
+src/engine.*      zip and RAR reading, space planning, extract + truncate / hole punching
 src/gfx.*         Direct2D / DirectWrite drawing in the ZeroZip style, with the embedded fonts
 src/main.cpp      the window, its screens and input, and the engine on a worker thread
 src/shell.cpp     ZeroZipShell.dll, the Windows 11 right-click entry
-third_party/      zstd (decoder) and miniz (inflate)
+third_party/      zstd (decoder), miniz (inflate) and UnRAR
 tests/            engine tests
 assets/           the icon, the script that draws it, the fonts, and the menu package
 ```
@@ -141,6 +150,7 @@ assets/           the icon, the script that draws it, the fonts, and the menu pa
 ## Credits
 
 - [Zstandard](https://github.com/facebook/zstd) (BSD)
+- [UnRAR](https://www.rarlab.com/rar_add.htm) by Alexander Roshal, under its own license: "UnRAR source code may be used in any software to handle RAR archives without limitations free of charge, but cannot be used to develop RAR (WinRAR) compatible archiver and to re-create RAR compression algorithm, which is proprietary. Distribution of modified UnRAR source code in separate form or as a part of other software is permitted, provided that full text of this paragraph, starting from "UnRAR source code" words, is included in license, or in documentation if license is not available, and in source code comments of resulting package."
 - [miniz](https://github.com/richgel999/miniz) (MIT)
 - [Geist](https://vercel.com/font) and Geist Mono fonts (SIL OFL 1.1)
 
